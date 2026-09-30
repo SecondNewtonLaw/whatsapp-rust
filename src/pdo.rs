@@ -55,13 +55,54 @@ impl Client {
     /// * `info` - The MessageInfo for the message that failed to decrypt
     ///
     /// # Returns
-    /// * `Ok(())` if the request was sent successfully
+    /// * `Ok(())` if the request was sent, already requested, or pending
     /// * `Err` if we couldn't send the request (e.g., not logged in)
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.pdo.placeholder_resend", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id), err(Debug)))]
     pub async fn send_pdo_placeholder_resend_request(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
     ) -> Result<(), anyhow::Error> {
+        self.send_pdo_placeholder_resend_request_impl(info, false)
+            .await
+            .map(|_| ())
+    }
+
+    /// Retry a phone request: `Some(id)` was sent, `None` is already pending.
+    pub async fn retry_pdo_placeholder_resend_request(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+    ) -> Result<Option<String>, anyhow::Error> {
+        use wacore_binary::Server;
+        anyhow::ensure!(!info.id.is_empty(), "message id is empty");
+        anyhow::ensure!(
+            !info.source.chat.user.is_empty()
+                && matches!(
+                    info.source.chat.server,
+                    Server::Pn | Server::Lid | Server::Group | Server::Broadcast
+                )
+                && info.source.is_group == info.source.chat.is_group(),
+            "invalid placeholder chat"
+        );
+        anyhow::ensure!(
+            !info.source.sender.user.is_empty()
+                && matches!(
+                    info.source.sender.server,
+                    Server::Pn | Server::Lid | Server::Hosted | Server::HostedLid | Server::Bot
+                ),
+            "invalid placeholder sender"
+        );
+        if !self.is_connected() {
+            return Err(crate::client::ClientError::NotConnected.into());
+        }
+        self.send_pdo_placeholder_resend_request_impl(info, true)
+            .await
+    }
+
+    async fn send_pdo_placeholder_resend_request_impl(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        explicit_retry: bool,
+    ) -> Result<Option<String>, anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
 
@@ -117,18 +158,23 @@ impl Client {
         // release the slot on send failure below.
         let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let claimed_clone = claimed.clone();
-        self.pdo_requested
+        let request_id = self.generate_message_id();
+        let memo_id = request_id.clone();
+        let prior_memo = self
+            .pdo_requested
             .get_with(gate_key.clone(), async move {
                 claimed_clone.store(true, std::sync::atomic::Ordering::Release);
+                memo_id
             })
             .await;
-        if !claimed.load(std::sync::atomic::Ordering::Acquire) {
+        let claimed = claimed.load(std::sync::atomic::Ordering::Acquire);
+        if !claimed && !explicit_retry {
             debug!(
                 "PDO request already sent for message {} from {}; not re-requesting",
                 info.id,
                 info.source.sender.observe()
             );
-            return Ok(());
+            return Ok(None);
         }
 
         // Reserved atomically, not read-then-written. Two senders sharing one
@@ -138,13 +184,17 @@ impl Client {
         // `(chat, id)` and carries whichever `MessageInfo` won the overwrite,
         // so the recovered content would be dispatched under the other
         // sender's identity.
-        let pending = PendingPdoRequest {
-            message_info: Arc::clone(info),
-            requested_at: wacore::time::Instant::now(),
-        };
+        let pending = (
+            PendingPdoRequest {
+                message_info: Arc::clone(info),
+                requested_at: wacore::time::Instant::now(),
+            },
+            request_id.clone(),
+            explicit_retry,
+        );
         let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reserved_clone = reserved.clone();
-        let holder = self
+        let (holder, _, _) = self
             .pdo_pending_requests
             .get_with(cache_key.clone(), async move {
                 reserved_clone.store(true, std::sync::atomic::Ordering::Release);
@@ -158,8 +208,10 @@ impl Client {
             // redelivery then recreates the gate, finds its own entry here,
             // and removing it would let a later redelivery send a second
             // request for a message that already has one out.
-            if holder.message_info.source.sender != info.source.sender {
-                self.pdo_requested.remove(&gate_key).await;
+            if claimed && holder.message_info.source.sender != info.source.sender {
+                self.pdo_requested
+                    .remove_if(&gate_key, |id| id == &request_id)
+                    .await;
             }
             // Another sender's request for this `(chat, id)` is in flight.
             // Nothing was sent for this one, so it must not keep the slot it
@@ -171,7 +223,13 @@ impl Client {
                 info.id,
                 info.source.sender.observe()
             );
-            return Ok(());
+            return Ok(None);
+        }
+
+        if explicit_retry {
+            self.pdo_requested
+                .insert(gate_key.clone(), request_id.clone())
+                .await;
         }
 
         let message_key = wa::MessageKey {
@@ -216,18 +274,31 @@ impl Client {
 
         // A failed send must not consume the once-per-message slot, or a
         // transient error would permanently block recovery for this message.
-        if let Err(e) = self
-            .ensure_e2e_sessions(std::slice::from_ref(&peer_target))
-            .await
-        {
-            self.pdo_pending_requests.remove(&cache_key).await;
-            self.pdo_requested.remove(&gate_key).await;
-            return Err(e);
+        let send = async {
+            self.ensure_e2e_sessions(std::slice::from_ref(&peer_target))
+                .await?;
+            self.send_peer_message_with_id(peer_target, &msg, &request_id)
+                .await
         }
-
-        if let Err(e) = self.send_peer_message(peer_target, &msg).await {
-            self.pdo_pending_requests.remove(&cache_key).await;
-            self.pdo_requested.remove(&gate_key).await;
+        .await;
+        if let Err(e) = send {
+            self.pdo_pending_requests
+                .remove_if(&cache_key, |(_, id, _)| id == &request_id)
+                .await;
+            if explicit_retry && !claimed {
+                self.pdo_requested
+                    .upsert_with_by_ref(&gate_key, |current| {
+                        (
+                            current.filter(|id| *id == &request_id).map(|_| prior_memo),
+                            (),
+                        )
+                    })
+                    .await;
+            } else {
+                self.pdo_requested
+                    .remove_if(&gate_key, |id| id == &request_id)
+                    .await;
+            }
             warn!(
                 "Failed to send PDO request for message {}: {:?}",
                 info.id, e
@@ -236,7 +307,7 @@ impl Client {
         }
 
         debug!("PDO request sent successfully for message {}", info.id);
-        Ok(())
+        Ok(Some(request_id))
     }
 
     /// Request on-demand message history from the primary phone via PDO.
@@ -828,48 +899,20 @@ impl Client {
         // boundary between these two legs. Keep the response key primary, and
         // only spend one alias lookup after that direct key misses. Groups do
         // not have a PN/LID namespace and must never take this path.
-        let mut pending = self.pdo_pending_requests.remove(&cache_key).await;
-        if pending.is_none()
-            && !cache_key.chat.is_group()
-            && let Some(alias) = self.swap_pn_lid_namespace(&cache_key.chat).await
-        {
-            let alias_key = ChatMessageId::new(alias, msg_id.into());
-            pending = self.pdo_pending_requests.remove(&alias_key).await;
-        }
-
-        // The pending map is keyed by `(chat, id)`, which does not name a
-        // sender, and the slot expires and can be evicted while a request is
-        // still in flight. So the entry found here is not necessarily the one
-        // this response answers: another participant sharing the id may have
-        // reserved the key in between. Trusting it then would dispatch this
-        // sender's recovered content under the other's identity.
-        //
-        // Only keep it when the response names the same author. On anything
-        // else — a different author, or a spelling this cannot match — fall
-        // through to rebuilding from the response, which is the authority on
-        // who sent what and is the same path a missing entry already takes.
-        let pending = pending.filter(|entry| {
-            if response_from_me != entry.message_info.source.is_from_me {
+        // Missing IDs are accepted only for validated automatic entries.
+        let matches_pending = |(entry, id, explicit_retry): &(PendingPdoRequest, String, bool)| {
+            if (request_id.is_empty() && *explicit_retry)
+                || (!request_id.is_empty() && id != request_id)
+                || response_from_me != entry.message_info.source.is_from_me
+            {
                 return false;
             }
             let Some(participant) = response_participant.as_deref() else {
-                // Legitimately absent for a DM and for anything `from_me`, so
-                // the only thing left to agree on is the direction. An incoming
-                // and an outgoing message of one DM can share an id, and both
-                // their responses omit the participant.
-                return true;
+                return response_from_me || !entry.message_info.source.is_group;
             };
             let Ok(participant) = participant.parse::<Jid>() else {
                 return false;
             };
-            // Against both spellings the stanza gave us, not the raw string.
-            // A LID-addressed group stores the LID in `sender` and its PN in
-            // `sender_alt`, while the phone answers in PN, so comparing one
-            // spelling would reject every genuine entry and throw away the
-            // addressing mode, sender alias and stanza metadata with it.
-            //
-            // Both come from the delivery itself rather than from a mapping
-            // learned at runtime, so this comparison does not move under us.
             let participant = participant.to_non_ad();
             let source = &entry.message_info.source;
             source.sender.to_non_ad() == participant
@@ -877,7 +920,22 @@ impl Client {
                     .sender_alt
                     .as_ref()
                     .is_some_and(|alt| alt.to_non_ad() == participant)
-        });
+        };
+        let mut pending = self
+            .pdo_pending_requests
+            .remove_if(&cache_key, &matches_pending)
+            .await;
+        if pending.is_none()
+            && !cache_key.chat.is_group()
+            && let Some(alias) = self.swap_pn_lid_namespace(&cache_key.chat).await
+        {
+            let alias_key = ChatMessageId::new(alias, msg_id.into());
+            pending = self
+                .pdo_pending_requests
+                .remove_if(&alias_key, matches_pending)
+                .await;
+        }
+        let pending = pending.map(|(entry, _, _)| entry);
 
         let elapsed = pending
             .as_ref()
@@ -1397,7 +1455,10 @@ mod tests {
             info.id.clone(),
             info.source.sender.clone(),
         );
-        client.pdo_requested.insert(gate_key, ()).await;
+        client
+            .pdo_requested
+            .insert(gate_key, "prior-request".into())
+            .await;
 
         let res = client.send_pdo_placeholder_resend_request(&info).await;
 
@@ -1447,7 +1508,7 @@ mod tests {
                     first.id.clone(),
                     first.source.sender.clone(),
                 ),
-                (),
+                "prior-request".into(),
             )
             .await;
 
@@ -1510,10 +1571,14 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(first.source.chat.clone(), first.id.clone()),
-                crate::pdo::PendingPdoRequest {
-                    message_info: first.clone(),
-                    requested_at: wacore::time::Instant::now(),
-                },
+                (
+                    crate::pdo::PendingPdoRequest {
+                        message_info: first.clone(),
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "req-first".into(),
+                    false,
+                ),
             )
             .await;
 
@@ -1558,10 +1623,14 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 key.clone(),
-                super::PendingPdoRequest {
-                    message_info: make_group_message_info(chat, "203040904720543@lid", msg_id),
-                    requested_at: wacore::time::Instant::now(),
-                },
+                (
+                    super::PendingPdoRequest {
+                        message_info: make_group_message_info(chat, "203040904720543@lid", msg_id),
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "req-attr".into(),
+                    false,
+                ),
             )
             .await;
 
@@ -1587,8 +1656,8 @@ mod tests {
             .await;
 
         assert!(
-            client.pdo_pending_requests.get(&key).await.is_none(),
-            "the response still consumes the slot it found"
+            client.pdo_pending_requests.get(&key).await.is_some(),
+            "a response must preserve another sender's pending request"
         );
 
         let senders: Vec<String> = {
@@ -1638,10 +1707,14 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 key,
-                super::PendingPdoRequest {
-                    message_info: std::sync::Arc::new(info),
-                    requested_at: wacore::time::Instant::now(),
-                },
+                (
+                    super::PendingPdoRequest {
+                        message_info: std::sync::Arc::new(info),
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "req-alias".into(),
+                    false,
+                ),
             )
             .await;
 
@@ -1719,10 +1792,14 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(lid.parse().expect("lid"), msg_id.into()),
-                super::PendingPdoRequest {
-                    message_info: pending,
-                    requested_at: wacore::time::Instant::now(),
-                },
+                (
+                    super::PendingPdoRequest {
+                        message_info: pending,
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "req-pn-alias".into(),
+                    false,
+                ),
             )
             .await;
 
@@ -1778,15 +1855,19 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(pn.parse().expect("pn"), msg_id.into()),
-                super::PendingPdoRequest {
-                    message_info: make_dm_pending_info(
-                        pn,
-                        lid,
-                        msg_id,
-                        wacore::types::message::AddressingMode::Pn,
-                    ),
-                    requested_at: wacore::time::Instant::now(),
-                },
+                (
+                    super::PendingPdoRequest {
+                        message_info: make_dm_pending_info(
+                            pn,
+                            lid,
+                            msg_id,
+                            wacore::types::message::AddressingMode::Pn,
+                        ),
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "req-lid-alias".into(),
+                    false,
+                ),
             )
             .await;
 
@@ -1845,30 +1926,38 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(pn.parse().unwrap(), msg_id.into()),
-                super::PendingPdoRequest {
-                    message_info: make_dm_pending_info(
-                        pn,
-                        lid,
-                        msg_id,
-                        wacore::types::message::AddressingMode::Pn,
-                    ),
-                    requested_at: wacore::time::Instant::now(),
-                },
+                (
+                    super::PendingPdoRequest {
+                        message_info: make_dm_pending_info(
+                            pn,
+                            lid,
+                            msg_id,
+                            wacore::types::message::AddressingMode::Pn,
+                        ),
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "req-direct".into(),
+                    false,
+                ),
             )
             .await;
         client
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(lid.parse().unwrap(), msg_id.into()),
-                super::PendingPdoRequest {
-                    message_info: make_dm_pending_info(
-                        lid,
-                        pn,
-                        msg_id,
-                        wacore::types::message::AddressingMode::Lid,
-                    ),
-                    requested_at: wacore::time::Instant::now(),
-                },
+                (
+                    super::PendingPdoRequest {
+                        message_info: make_dm_pending_info(
+                            lid,
+                            pn,
+                            msg_id,
+                            wacore::types::message::AddressingMode::Lid,
+                        ),
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "req-alias-other".into(),
+                    false,
+                ),
             )
             .await;
 
@@ -1919,15 +2008,19 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(pn.parse().unwrap(), msg_id.into()),
-                super::PendingPdoRequest {
-                    message_info: make_dm_pending_info(
-                        pn,
-                        lid,
-                        msg_id,
-                        wacore::types::message::AddressingMode::Pn,
-                    ),
-                    requested_at: wacore::time::Instant::now(),
-                },
+                (
+                    super::PendingPdoRequest {
+                        message_info: make_dm_pending_info(
+                            pn,
+                            lid,
+                            msg_id,
+                            wacore::types::message::AddressingMode::Pn,
+                        ),
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "req-no-mapping".into(),
+                    false,
+                ),
             )
             .await;
 
@@ -1987,10 +2080,14 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 key,
-                super::PendingPdoRequest {
-                    message_info: std::sync::Arc::new(outgoing),
-                    requested_at: wacore::time::Instant::now(),
-                },
+                (
+                    super::PendingPdoRequest {
+                        message_info: std::sync::Arc::new(outgoing),
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "req-direction".into(),
+                    false,
+                ),
             )
             .await;
 
@@ -2031,6 +2128,395 @@ mod tests {
             "the response is for the incoming message; the outgoing entry in \
              the slot must not relabel it as ours"
         );
+    }
+
+    mod manual_retry {
+        use super::super::{Arc, Client, MessageInfo, PendingPdoRequest, wa};
+        use super::{
+            make_group_message_info, make_placeholder_response, make_web_msg, set_own_pn,
+            setup_reconstruct_client,
+        };
+        use wacore::types::jid::JidExt as _;
+        use wacore::types::message::ChatMessageId;
+        use wacore_binary::Jid;
+
+        async fn manual_retry_client() -> (
+            Arc<Client>,
+            Arc<crate::transport::mock::CapturingMockTransport>,
+            Arc<MessageInfo>,
+        ) {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            use crate::store::commands::DeviceCommand;
+            client
+                .persistence_manager
+                .process_command(DeviceCommand::SetId(Some(
+                    "12025550100:2@s.whatsapp.net".parse().unwrap(),
+                )))
+                .await;
+            client
+                .persistence_manager
+                .process_command(DeviceCommand::SetAccount(Some(
+                    wa::ADVSignedDeviceIdentity::default(),
+                )))
+                .await;
+            crate::test_utils::seed_peer_session(
+                &client,
+                &"12025550100@s.whatsapp.net".parse().unwrap(),
+            )
+            .await;
+            let info = make_group_message_info(
+                "120363000000000001@g.us",
+                "12025550101@s.whatsapp.net",
+                "MANUAL_PDO_SYNTHETIC",
+            );
+            (client, transport, info)
+        }
+
+        #[tokio::test]
+        async fn manual_pdo_sends_after_automatic_memo_without_releasing_it() {
+            let (client, transport, info) = manual_retry_client().await;
+            let gate = wacore::types::message::SenderMessageId::new(
+                info.source.chat.clone(),
+                info.id.clone(),
+                info.source.sender.clone(),
+            );
+            client
+                .pdo_requested
+                .insert(gate.clone(), "AUTOMATIC_REQUEST".into())
+                .await;
+            let id = client
+                .retry_pdo_placeholder_resend_request(&info)
+                .await
+                .unwrap()
+                .unwrap();
+            let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+            assert_eq!(sent.get().tag.as_ref(), "message");
+            assert_eq!(
+                sent.get().attrs().optional_string("id").as_deref(),
+                Some(id.as_str())
+            );
+            assert_eq!(
+                sent.get().attrs().optional_string("category").as_deref(),
+                Some("peer")
+            );
+            assert_eq!(
+                sent.get().attrs().optional_jid("to").unwrap(),
+                "12025550100@s.whatsapp.net".parse::<Jid>().unwrap()
+            );
+            assert!(
+                client
+                    .retry_pdo_placeholder_resend_request(&info)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            for _ in 0..3 {
+                client
+                    .send_pdo_placeholder_resend_request(&info)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(transport.sent().len(), 1);
+            assert_eq!(
+                client.pdo_requested.get(&gate).await.as_deref(),
+                Some(id.as_str())
+            );
+        }
+
+        #[tokio::test]
+        async fn manual_pdo_can_ask_again_after_a_contentless_response() {
+            use buffa::Message as _;
+            let (client, transport, info) = manual_retry_client().await;
+            let first = client
+                .retry_pdo_placeholder_resend_request(&info)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut response = make_placeholder_response(
+                &info.source.chat.to_string(),
+                false,
+                &info.id,
+                Some(&info.source.sender.to_string()),
+            );
+            response.web_message_info_bytes = Some(
+                make_web_msg(
+                    &info.source.chat.to_string(),
+                    false,
+                    &info.id,
+                    Some(&info.source.sender.to_string()),
+                )
+                .encode_to_vec(),
+            );
+            client
+                .handle_placeholder_resend_response(&response, &first)
+                .await;
+            client
+                .send_pdo_placeholder_resend_request(&info)
+                .await
+                .unwrap();
+            let second = client
+                .retry_pdo_placeholder_resend_request(&info)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(first, second);
+            let sent = crate::test_utils::decode_sent_iq(&transport, 1).await;
+            assert_eq!(
+                sent.get().attrs().optional_string("id").as_deref(),
+                Some(second.as_str())
+            );
+            assert_eq!(transport.sent().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn concurrent_manual_and_automatic_pdo_requests_send_once() {
+            let (client, transport, info) = manual_retry_client().await;
+            let (first, second, automatic) = tokio::join!(
+                client.retry_pdo_placeholder_resend_request(&info),
+                client.retry_pdo_placeholder_resend_request(&info),
+                client.send_pdo_placeholder_resend_request(&info),
+            );
+            automatic.unwrap();
+            let sent = [first.unwrap(), second.unwrap()];
+            assert!(sent.iter().filter(|id| id.is_some()).count() <= 1);
+            crate::test_utils::decode_sent_iq(&transport, 0).await;
+            assert_eq!(transport.sent().len(), 1);
+            let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+            assert!(client.pdo_pending_requests.get(&key).await.is_some());
+        }
+
+        #[tokio::test]
+        async fn manual_pdo_errors_never_report_a_send_or_spend_an_older_memo() {
+            let (client, transport, info) = manual_retry_client().await;
+            let mut empty = (*info).clone();
+            empty.id = "".into();
+            let mut wrong_group = (*info).clone();
+            wrong_group.source.is_group = false;
+            let mut wrong_sender = (*info).clone();
+            wrong_sender.source.sender = info.source.chat.clone();
+            for invalid in [empty, wrong_group, wrong_sender] {
+                assert!(
+                    client
+                        .retry_pdo_placeholder_resend_request(&Arc::new(invalid))
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(client.pdo_requested.entry_count_async().await, 0);
+            client.set_connected_for_test(false);
+            assert!(
+                client
+                    .retry_pdo_placeholder_resend_request(&info)
+                    .await
+                    .is_err()
+            );
+            client.set_connected_for_test(true);
+            let gate = wacore::types::message::SenderMessageId::new(
+                info.source.chat.clone(),
+                info.id.clone(),
+                info.source.sender.clone(),
+            );
+            client
+                .pdo_requested
+                .insert(gate.clone(), "AUTOMATIC_REQUEST".into())
+                .await;
+            *client.noise_socket.lock().unwrap() = None;
+            assert!(
+                client
+                    .retry_pdo_placeholder_resend_request(&info)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(client.pdo_pending_requests.entry_count_async().await, 0);
+            assert_eq!(
+                client.pdo_requested.get(&gate).await.as_deref(),
+                Some("AUTOMATIC_REQUEST")
+            );
+            assert!(transport.sent().is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_old_failed_pdo_send_preserves_a_new_pending_request_and_memo() {
+            let (client, transport, info) = manual_retry_client().await;
+            let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+            let gate = wacore::types::message::SenderMessageId::new(
+                info.source.chat.clone(),
+                info.id.clone(),
+                info.source.sender.clone(),
+            );
+            let peer: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
+            let mutex = client
+                .session_lock_for(peer.to_protocol_address().as_str())
+                .await;
+            let lock = mutex.lock().await;
+            let old = {
+                let client = client.clone();
+                let info = info.clone();
+                tokio::spawn(
+                    async move { client.retry_pdo_placeholder_resend_request(&info).await },
+                )
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while client.pdo_pending_requests.get(&key).await.is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            client
+                .pdo_pending_requests
+                .insert(
+                    key.clone(),
+                    (
+                        PendingPdoRequest {
+                            message_info: info,
+                            requested_at: wacore::time::Instant::now(),
+                        },
+                        "NEW_REQUEST".into(),
+                        true,
+                    ),
+                )
+                .await;
+            client
+                .pdo_requested
+                .insert(gate.clone(), "NEW_REQUEST".into())
+                .await;
+            *client.noise_socket.lock().unwrap() = None;
+            drop(lock);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), old)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            assert_eq!(
+                client.pdo_pending_requests.get(&key).await.unwrap().1,
+                "NEW_REQUEST"
+            );
+            assert_eq!(
+                client.pdo_requested.get(&gate).await.as_deref(),
+                Some("NEW_REQUEST")
+            );
+            assert!(transport.sent().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_late_pdo_reply_preserves_the_new_attempt_until_its_matching_reply() {
+            use buffa::Message as _;
+            use wacore::types::events::ChannelEventHandler;
+            let (client, transport, info) = manual_retry_client().await;
+            let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+            let first = client
+                .retry_pdo_placeholder_resend_request(&info)
+                .await
+                .unwrap()
+                .unwrap();
+            client.pdo_pending_requests.remove(&key).await;
+            let second = client
+                .retry_pdo_placeholder_resend_request(&info)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut response = make_placeholder_response(
+                &info.source.chat.to_string(),
+                false,
+                &info.id,
+                Some(&info.source.sender.to_string()),
+            );
+            response.web_message_info_bytes = Some(
+                make_web_msg(
+                    &info.source.chat.to_string(),
+                    false,
+                    &info.id,
+                    Some(&info.source.sender.to_string()),
+                )
+                .encode_to_vec(),
+            );
+            client
+                .handle_placeholder_resend_response(&response, &first)
+                .await;
+            assert_eq!(
+                client.pdo_pending_requests.get(&key).await.unwrap().1,
+                second
+            );
+            let (handler, rx) = ChannelEventHandler::new();
+            client.core.event_bus.subscribe_handler(handler).detach();
+            response = make_placeholder_response(
+                &info.source.chat.to_string(),
+                false,
+                &info.id,
+                Some(&info.source.sender.to_string()),
+            );
+            client
+                .handle_placeholder_resend_response(&response, &second)
+                .await;
+            assert!(client.pdo_pending_requests.get(&key).await.is_none());
+            let event = rx.try_recv().unwrap();
+            let recovered = event.messages().next().unwrap();
+            assert_eq!(
+                recovered.info.unavailable_request_id.as_deref(),
+                Some(second.as_str())
+            );
+            assert_eq!(recovered.info.source.sender, info.source.sender);
+            crate::test_utils::decode_sent_iq(&transport, 1).await;
+            assert_eq!(transport.sent().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn pdo_missing_request_id_only_consumes_validated_automatic_entries() {
+            use wacore::types::events::ChannelEventHandler;
+            for explicit_retry in [false, true] {
+                let client = setup_reconstruct_client().await;
+                set_own_pn(&client).await;
+                let mut info = (*make_group_message_info(
+                    "120363000000000001@g.us",
+                    "12025550101@s.whatsapp.net",
+                    "PDO_WITHOUT_REQUEST_ID",
+                ))
+                .clone();
+                info.push_name = "pending metadata".into();
+                let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+                client
+                    .pdo_pending_requests
+                    .insert(
+                        key.clone(),
+                        (
+                            PendingPdoRequest {
+                                message_info: Arc::new(info.clone()),
+                                requested_at: wacore::time::Instant::now(),
+                            },
+                            "CURRENT_REQUEST".into(),
+                            explicit_retry,
+                        ),
+                    )
+                    .await;
+                let (handler, rx) = ChannelEventHandler::new();
+                client.core.event_bus.subscribe_handler(handler).detach();
+                let response = make_placeholder_response(
+                    &info.source.chat.to_string(),
+                    false,
+                    &info.id,
+                    Some(&info.source.sender.to_string()),
+                );
+                client
+                    .handle_placeholder_resend_response(&response, "")
+                    .await;
+                assert_eq!(
+                    client.pdo_pending_requests.get(&key).await.is_some(),
+                    explicit_retry
+                );
+                let mut delivered = Vec::new();
+                while let Ok(event) = rx.try_recv() {
+                    delivered.extend(event.messages().map(|message| message.info.clone()));
+                }
+                assert_eq!(delivered.len(), 1);
+                assert_eq!(
+                    delivered[0].push_name.as_str() == "pending metadata",
+                    !explicit_retry
+                );
+            }
+        }
     }
 
     /// A transient send failure must release the once-per-message slot, or
@@ -2096,15 +2582,27 @@ mod tests {
             chat.parse().expect("chat jid"),
         );
 
-        client.pdo_requested.insert(gate_key.clone(), ()).await;
+        client
+            .pdo_requested
+            .insert(gate_key.clone(), "req-1".into())
+            .await;
         client
             .pdo_pending_requests
             .insert(
                 key.clone(),
-                super::PendingPdoRequest {
-                    message_info: make_group_message_info(chat, chat, msg_id),
-                    requested_at: wacore::time::Instant::now(),
-                },
+                (
+                    super::PendingPdoRequest {
+                        message_info: make_dm_pending_info(
+                            chat,
+                            chat,
+                            msg_id,
+                            wacore::types::message::AddressingMode::Pn,
+                        ),
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "req-1".into(),
+                    false,
+                ),
             )
             .await;
 

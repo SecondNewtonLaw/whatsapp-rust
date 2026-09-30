@@ -1431,17 +1431,34 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        self.remove_if(key, |_| true).await
+    }
+
+    /// Remove a live entry only when its value matches, under the write lock.
+    pub(crate) async fn remove_if<Q>(&self, key: &Q, matches: impl FnOnce(&V) -> bool) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let mut guard = self.inner.write().await;
         match &mut *guard {
-            Storage::Plain(inner) => inner.remove_key(key),
-            Storage::Managed(inner) => {
-                let entry = inner.remove_key(key)?;
-                // Nothing to date until an entry is actually in hand.
-                let now = self.entry_time();
-                if self.is_expired(&entry, now) {
-                    None
+            Storage::Plain(inner) => {
+                if matches(inner.get(key)?) {
+                    inner.remove_key(key)
                 } else {
-                    Some(entry.value)
+                    None
+                }
+            }
+            Storage::Managed(inner) => {
+                let entry = inner.get(key)?;
+                let now = self.entry_time();
+                if self.is_expired(entry, now) {
+                    inner.remove_key(key);
+                    None
+                } else if matches(&entry.value) {
+                    inner.remove_key(key).map(|entry| entry.value)
+                } else {
+                    None
                 }
             }
         }
@@ -1992,6 +2009,28 @@ mod tests {
         cache.insert("key1".to_string(), "v2".to_string()).await;
         assert_eq!(cache.get("key1").await, Some("v2".to_string()));
         assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn conditional_removal_preserves_mismatches_and_has_one_winner() {
+        for cache in [
+            build_cache::<String, u32>(),
+            PortableCache::builder().build(),
+        ] {
+            cache.insert("key".into(), 7).await;
+            assert_eq!(cache.remove_if("key", |value| *value == 6).await, None);
+            assert_eq!(cache.get("key").await, Some(7));
+            let (first, second) = tokio::join!(
+                cache.remove_if("key", |value| *value == 7),
+                cache.remove_if("key", |value| *value == 7),
+            );
+            assert_eq!(
+                usize::from(first.is_some()) + usize::from(second.is_some()),
+                1
+            );
+            assert_eq!(first.or(second), Some(7));
+            assert_eq!(cache.get("key").await, None);
+        }
     }
 
     #[tokio::test]

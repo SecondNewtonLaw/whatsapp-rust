@@ -58,7 +58,9 @@ async fn send_automatic(client: &Arc<Client>, info: &Arc<MessageInfo>) -> String
         .clone()
 }
 
-fn top_level_response(info: &MessageInfo) -> wa::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse{
+type PlaceholderResponse = wa::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse;
+
+fn top_level_response(info: &MessageInfo) -> PlaceholderResponse {
     let mut response =
         make_placeholder_response(&info.source.chat.to_string(), false, &info.id, None);
     let mut web =
@@ -159,14 +161,14 @@ async fn previous_response_while_retry_waits_for_session_is_delivered() {
         .await;
     let lock = session.lock().await;
     let mut retry = Box::pin(client.retry_pdo_placeholder_resend_request(&info));
-    assert!(futures::poll!(&mut retry).is_pending());
-    assert!(
-        client
-            .pdo_pending_requests
-            .get(&pending_key(&info))
-            .await
-            .is_some()
-    );
+    tokio::select! {
+        result = &mut retry => panic!("session-wait retry unexpectedly finished: {result:?}"),
+        result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while client.pdo_pending_requests.get(&pending_key(&info)).await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        }) => { result.unwrap(); }
+    }
     let (handler, rx) = ChannelEventHandler::new();
     client.core.event_bus.subscribe_handler(handler).detach();
     let response = make_placeholder_response(
@@ -227,11 +229,12 @@ async fn cancelled_caller_does_not_undo_a_transport_accepted_retry() {
     ));
     *client.noise_socket.lock().unwrap() = Some(socket.clone());
     let mut retry = Box::pin(client.retry_pdo_placeholder_resend_request(&info));
-    assert!(futures::poll!(&mut retry).is_pending());
-    tokio::time::timeout(std::time::Duration::from_secs(5), arrived.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::select! {
+        result = &mut retry => panic!("retained write unexpectedly finished: {result:?}"),
+        result = tokio::time::timeout(std::time::Duration::from_secs(5), arrived.recv()) => {
+            result.unwrap().unwrap();
+        }
+    }
     let node = crate::test_utils::decode_sent_iq(&capture, 0).await;
     let latest = node
         .get()

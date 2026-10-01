@@ -1148,7 +1148,7 @@ impl Client {
         let authority = pending.as_ref().map(|(_, memo)| memo.clone());
         let pending = pending.map(|(entry, _)| entry);
         if self
-            .obsolete_manual_pdo_response(
+            .obsolete_pdo_response(
                 &cache_key,
                 alias_key.as_ref(),
                 response_from_me,
@@ -1198,7 +1198,7 @@ impl Client {
             message.get_base_message().get_ephemeral_expiration()
         };
         if self
-            .obsolete_manual_pdo_response(
+            .obsolete_pdo_response(
                 &cache_key,
                 alias_key.as_ref(),
                 response_from_me,
@@ -1254,7 +1254,7 @@ impl Client {
         publication.complete();
     }
 
-    async fn obsolete_manual_pdo_response(
+    async fn obsolete_pdo_response(
         &self,
         key: &ChatMessageId,
         alias: Option<&ChatMessageId>,
@@ -1263,18 +1263,18 @@ impl Client {
         request_id: &str,
         authority: Option<&Arc<PdoRequestMemo>>,
     ) -> bool {
-        let mut manual: Option<Arc<PdoRequestMemo>> = None;
+        let mut latest: Option<Arc<PdoRequestMemo>> = None;
         let mut consider = |memo: Arc<PdoRequestMemo>| {
             if let Some(owner) = memo.live_owner()
-                && owner.explicit_retry
+                && (owner.explicit_retry || owner.request_id == memo.request_id)
                 && (owner.matches_target(key, from_me, participant)
                     || alias.is_some_and(|alias| owner.matches_target(alias, from_me, participant)))
             {
-                if manual
+                if latest
                     .as_ref()
                     .is_none_or(|known| known.generation < owner.generation)
                 {
-                    manual = Some(owner);
+                    latest = Some(owner);
                 }
                 true
             } else {
@@ -1298,12 +1298,16 @@ impl Client {
                 if snapshot.info.id == key.id
                     && snapshot.generation != 0
                     && let Some(memo) = self.pdo_requested.get(gate.as_ref()).await
+                    && let Some(owner) = memo.live_owner()
+                    && owner.explicit_retry
                 {
-                    consider(memo);
+                    consider(owner);
                 }
             }
         }
-        manual.is_some_and(|owner| owner.request_id != request_id)
+        latest.is_some_and(|owner| {
+            owner.request_id != request_id && (owner.explicit_retry || !request_id.is_empty())
+        })
     }
 
     /// Reconstructs a MessageInfo from a WebMessageInfo.
@@ -2194,8 +2198,7 @@ mod tests {
         assert_eq!(infos[0].push_name, "pending metadata");
     }
 
-    /// A direct hit remains primary: an alias entry is not consumed or allowed
-    /// to replace the metadata belonging to the response's direct key.
+    /// Without ownership order, a direct hit keeps its metadata and leaves the alias entry intact.
     #[tokio::test]
     async fn pdo_direct_pending_hit_does_not_consume_alias() {
         use wacore::types::events::ChannelEventHandler;
@@ -2214,22 +2217,20 @@ mod tests {
                 learning_source: wacore::types::lid_pn::LearningSource::Usync,
             })
             .await;
+        let direct_info =
+            make_dm_pending_info(pn, lid, msg_id, wacore::types::message::AddressingMode::Pn);
+        let alias_info =
+            make_dm_pending_info(lid, pn, msg_id, wacore::types::message::AddressingMode::Lid);
         client
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(pn.parse().unwrap(), msg_id.into()),
-                super::test_pending(
+                (
                     super::PendingPdoRequest {
-                        message_info: make_dm_pending_info(
-                            pn,
-                            lid,
-                            msg_id,
-                            wacore::types::message::AddressingMode::Pn,
-                        ),
+                        message_info: direct_info.clone(),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "req-direct",
-                    false,
+                    super::PdoRequestMemo::new(&direct_info, "req-direct".into(), false, None),
                 ),
             )
             .await;
@@ -2237,18 +2238,12 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(lid.parse().unwrap(), msg_id.into()),
-                super::test_pending(
+                (
                     super::PendingPdoRequest {
-                        message_info: make_dm_pending_info(
-                            lid,
-                            pn,
-                            msg_id,
-                            wacore::types::message::AddressingMode::Lid,
-                        ),
+                        message_info: alias_info.clone(),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "req-alias-other",
-                    false,
+                    super::PdoRequestMemo::new(&alias_info, "req-alias-other".into(), false, None),
                 ),
             )
             .await;
@@ -2427,8 +2422,8 @@ mod tests {
             Arc, Client, MessageInfo, PdoRequestMemo, PendingPdoRequest, test_pending, wa,
         };
         use super::{
-            make_group_message_info, make_placeholder_response, make_web_msg, set_own_pn,
-            setup_reconstruct_client,
+            make_dm_pending_info, make_group_message_info, make_placeholder_response, make_web_msg,
+            set_own_pn, setup_reconstruct_client,
         };
         use wacore::types::jid::JidExt as _;
         use wacore::types::message::ChatMessageId;
@@ -3274,6 +3269,209 @@ mod tests {
             );
             assert_eq!(recovered.info.source.sender, info.source.sender);
             crate::test_utils::decode_sent_iq(&transport, 1).await;
+            assert_eq!(transport.sent().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn active_automatic_pdo_rejects_mismatched_ids_and_accepts_matching_or_legacy_ids() {
+            use buffa::Message as _;
+            use wacore::types::events::ChannelEventHandler;
+            use wacore::types::message::AddressingMode;
+            for legacy_id in [false, true] {
+                let (client, transport, info) = manual_retry_client().await;
+                let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+                client
+                    .send_pdo_placeholder_resend_request(&info)
+                    .await
+                    .unwrap();
+                let current = client
+                    .pdo_pending_requests
+                    .get(&key)
+                    .await
+                    .unwrap()
+                    .1
+                    .request_id
+                    .clone();
+                assert!(
+                    !client
+                        .pdo_explicit_published
+                        .load(std::sync::atomic::Ordering::Acquire)
+                );
+                let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+                assert_eq!(
+                    sent.get().attrs().optional_string("id").as_deref(),
+                    Some(current.as_str())
+                );
+                let (handler, rx) = ChannelEventHandler::new();
+                client.core.event_bus.subscribe_handler(handler).detach();
+                let mut response = make_placeholder_response(
+                    &info.source.chat.to_string(),
+                    false,
+                    &info.id,
+                    Some(&info.source.sender.to_string()),
+                );
+                let mut web = waproto::codec::web_message_info_decode(
+                    response.web_message_info_bytes.as_ref().unwrap(),
+                )
+                .unwrap();
+                web.message.as_option_mut().unwrap().conversation =
+                    Some("STALE_AUTOMATIC_CONTENT".into());
+                response.web_message_info_bytes = Some(web.encode_to_vec());
+                client
+                    .handle_placeholder_resend_response(&response, "OLD_AUTOMATIC_REQUEST")
+                    .await;
+                assert_eq!(
+                    client
+                        .pdo_pending_requests
+                        .get(&key)
+                        .await
+                        .unwrap()
+                        .1
+                        .request_id,
+                    current
+                );
+                while let Ok(event) = rx.try_recv() {
+                    assert!(
+                        event.messages().next().is_none(),
+                        "mismatched automatic content was published"
+                    );
+                }
+                web.message.as_option_mut().unwrap().conversation =
+                    Some("CURRENT_AUTOMATIC_CONTENT".into());
+                response.web_message_info_bytes = Some(web.encode_to_vec());
+                let request_id = if legacy_id { "" } else { current.as_str() };
+                client
+                    .handle_placeholder_resend_response(&response, request_id)
+                    .await;
+                assert!(client.pdo_pending_requests.get(&key).await.is_none());
+                let mut delivered = 0;
+                while let Ok(event) = rx.try_recv() {
+                    for message in event.messages() {
+                        assert_eq!(
+                            message.message.conversation.as_deref(),
+                            Some("CURRENT_AUTOMATIC_CONTENT")
+                        );
+                        assert_eq!(message.info.source.chat, info.source.chat);
+                        assert_eq!(message.info.source.sender, info.source.sender);
+                        assert_eq!(message.info.source.is_from_me, info.source.is_from_me);
+                        assert_eq!(
+                            message.info.unavailable_request_id.as_deref(),
+                            (!legacy_id).then_some(current.as_str())
+                        );
+                        delivered += 1;
+                    }
+                }
+                assert_eq!(delivered, 1);
+                assert_eq!(transport.sent().len(), 1);
+            }
+            let (client, transport, _) = manual_retry_client().await;
+            let pn = "12025550101@s.whatsapp.net";
+            let lid = "777000000000101@lid";
+            let msg_id = "PDO_AUTOMATIC_ALIAS_GENERATION";
+            client
+                .lid_pn_cache
+                .add(&wacore::types::lid_pn::LidPnEntry {
+                    lid: "777000000000101".into(),
+                    phone_number: "12025550101".into(),
+                    created_at: 0,
+                    learning_source: wacore::types::lid_pn::LearningSource::Usync,
+                })
+                .await;
+            let direct_info = make_dm_pending_info(pn, lid, msg_id, AddressingMode::Pn);
+            let mut alias_info =
+                (*make_dm_pending_info(lid, pn, msg_id, AddressingMode::Lid)).clone();
+            alias_info.source.sender_alt = None;
+            let alias_info = Arc::new(alias_info);
+            let direct_key = ChatMessageId::new(pn.parse().unwrap(), msg_id.into());
+            let alias_key = ChatMessageId::new(lid.parse().unwrap(), msg_id.into());
+            client
+                .send_pdo_placeholder_resend_request(&direct_info)
+                .await
+                .unwrap();
+            let direct = client
+                .pdo_pending_requests
+                .get(&direct_key)
+                .await
+                .unwrap()
+                .1;
+            client
+                .send_pdo_placeholder_resend_request(&alias_info)
+                .await
+                .unwrap();
+            let latest = client.pdo_pending_requests.get(&alias_key).await.unwrap().1;
+            assert!(latest.generation > direct.generation);
+            assert_ne!(latest.request_id, direct.request_id);
+            assert!(
+                !client
+                    .pdo_explicit_published
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            for (index, owner) in [(0, &direct), (1, &latest)] {
+                let sent = crate::test_utils::decode_sent_iq(&transport, index).await;
+                assert_eq!(
+                    sent.get().attrs().optional_string("id").as_deref(),
+                    Some(owner.request_id.as_str())
+                );
+            }
+            let (handler, rx) = ChannelEventHandler::new();
+            client.core.event_bus.subscribe_handler(handler).detach();
+            let mut response = make_placeholder_response(pn, false, msg_id, None);
+            let mut web = waproto::codec::web_message_info_decode(
+                response.web_message_info_bytes.as_ref().unwrap(),
+            )
+            .unwrap();
+            web.message.as_option_mut().unwrap().conversation =
+                Some("OLD_DIRECT_AUTOMATIC_CONTENT".into());
+            response.web_message_info_bytes = Some(web.encode_to_vec());
+            client
+                .handle_placeholder_resend_response(&response, &direct.request_id)
+                .await;
+            assert!(client.pdo_pending_requests.get(&direct_key).await.is_none());
+            assert_eq!(
+                client
+                    .pdo_pending_requests
+                    .get(&alias_key)
+                    .await
+                    .unwrap()
+                    .1
+                    .request_id,
+                latest.request_id
+            );
+            while let Ok(event) = rx.try_recv() {
+                assert!(
+                    event.messages().next().is_none(),
+                    "older direct automatic content bypassed newer alias owner"
+                );
+            }
+            web.message.as_option_mut().unwrap().conversation =
+                Some("LATEST_ALIAS_AUTOMATIC_CONTENT".into());
+            response.web_message_info_bytes = Some(web.encode_to_vec());
+            client
+                .handle_placeholder_resend_response(&response, &latest.request_id)
+                .await;
+            assert!(client.pdo_pending_requests.get(&alias_key).await.is_none());
+            let mut delivered = 0;
+            while let Ok(event) = rx.try_recv() {
+                for message in event.messages() {
+                    assert_eq!(
+                        message.message.conversation.as_deref(),
+                        Some("LATEST_ALIAS_AUTOMATIC_CONTENT")
+                    );
+                    assert_eq!(message.info.source.chat, alias_info.source.chat);
+                    assert_eq!(message.info.source.sender, alias_info.source.sender);
+                    assert_eq!(message.info.source.is_from_me, alias_info.source.is_from_me);
+                    assert_eq!(
+                        message.info.source.addressing_mode,
+                        Some(AddressingMode::Lid)
+                    );
+                    assert_eq!(
+                        message.info.unavailable_request_id.as_deref(),
+                        Some(latest.request_id.as_str())
+                    );
+                    delivered += 1;
+                }
+            }
+            assert_eq!(delivered, 1);
             assert_eq!(transport.sent().len(), 2);
         }
 

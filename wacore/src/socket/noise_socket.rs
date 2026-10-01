@@ -140,6 +140,12 @@ struct ObservedSendJob {
     observer: Option<Box<dyn SendObserver>>,
 }
 
+type SendWaiter = (
+    oneshot::Sender<SendResult>,
+    usize,
+    Option<Box<dyn SendObserver>>,
+);
+
 /// Observer for plaintext frames sent over the wire before encryption.
 pub trait FrameTap: crate::sync_marker::MaybeSendSync + 'static {
     /// Whether the tap is currently active.
@@ -288,11 +294,7 @@ impl NoiseSocket {
         let mut poisoned = false;
         // Reused across batches: one allocation for the life of the connection
         // instead of one per batch.
-        let mut waiters: Vec<(
-            oneshot::Sender<SendResult>,
-            usize,
-            Option<Box<dyn SendObserver>>,
-        )> = Vec::new();
+        let mut waiters: Vec<SendWaiter> = Vec::new();
         // A job pulled off the channel that would have overflowed the byte
         // ceiling, held over to open the next batch. Dropping it (on shutdown)
         // drops its response channel, which the caller sees as a closed sender:

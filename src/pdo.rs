@@ -413,42 +413,43 @@ impl Client {
         let explicit_published = &self.pdo_explicit_published;
         // Keep cache initialization out of the send frame. Its nested gate
         // update otherwise duplicates the cache state machines in this poll.
-        let (holder, owner) = Box::pin(self.pdo_pending_requests.get_with(
-            cache_key.clone(),
-            async {
-                let owner = self
-                    .pdo_requested
-                    .upsert_with_by_ref(
-                        &transfer_key,
-                        (&mut |current: Option<&Arc<PdoRequestMemo>>| {
-                            let previous = current.and_then(|current| {
-                                if current.request_id == transfer_memo.request_id {
-                                    current
-                                        .previous
-                                        .as_ref()
-                                        .and_then(PdoRequestMemo::live_owner)
-                                } else {
-                                    current.live_owner()
+        let initialize: wacore::runtime::BoxFuture<'_, _> = Box::pin(
+            self.pdo_pending_requests
+                .get_with(cache_key.clone(), async {
+                    let owner = self
+                        .pdo_requested
+                        .upsert_with_by_ref(
+                            &transfer_key,
+                            (&mut |current: Option<&Arc<PdoRequestMemo>>| {
+                                let previous = current.and_then(|current| {
+                                    if current.request_id == transfer_memo.request_id {
+                                        current
+                                            .previous
+                                            .as_ref()
+                                            .and_then(PdoRequestMemo::live_owner)
+                                    } else {
+                                        current.live_owner()
+                                    }
+                                });
+                                transfer_memo
+                                    .outcome
+                                    .store(PDO_FAILED, std::sync::atomic::Ordering::Release);
+                                let owner = transfer_memo.winning_owner(previous);
+                                attempt.0 = owner.clone();
+                                if owner.explicit_retry {
+                                    explicit_published
+                                        .store(true, std::sync::atomic::Ordering::Release);
                                 }
-                            });
-                            transfer_memo
-                                .outcome
-                                .store(PDO_FAILED, std::sync::atomic::Ordering::Release);
-                            let owner = transfer_memo.winning_owner(previous);
-                            attempt.0 = owner.clone();
-                            if owner.explicit_retry {
-                                explicit_published
-                                    .store(true, std::sync::atomic::Ordering::Release);
-                            }
-                            (Some(owner.clone()), owner)
-                        }) as PdoGateUpdate<'_, Arc<PdoRequestMemo>>,
-                    )
-                    .await;
-                reserved_clone.store(true, std::sync::atomic::Ordering::Release);
-                (pending.0, owner)
-            },
-        ))
-        .await;
+                                (Some(owner.clone()), owner)
+                            })
+                                as PdoGateUpdate<'_, Arc<PdoRequestMemo>>,
+                        )
+                        .await;
+                    reserved_clone.store(true, std::sync::atomic::Ordering::Release);
+                    (pending.0, owner)
+                }),
+        );
+        let (holder, owner) = initialize.await;
         if !reserved.load(std::sync::atomic::Ordering::Acquire) {
             // Only when the slot belongs to a *different* sender. The gate
             // cache has its own 512-entry capacity, so a burst can evict this
@@ -544,7 +545,7 @@ impl Client {
                 .await?;
             // Transfer the attempt guard with the actual socket job. Queued
             // work survives its caller, but only the writer starts ownership.
-            Box::pin(self.send_message_impl(
+            let pipeline: wacore::runtime::BoxFuture<'_, _> = Box::pin(self.send_message_impl(
                 peer_target,
                 &msg,
                 crate::send::SendPipelineOptions {
@@ -553,9 +554,8 @@ impl Client {
                     send_observer: Some(Box::new(attempt)),
                     ..Default::default()
                 },
-            ))
-            .await
-            .map(|_| ())
+            ));
+            pipeline.await.map(|_| ())
         }
         .await;
         if let Err(e) = send {

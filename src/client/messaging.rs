@@ -124,6 +124,7 @@ impl Client {
         observer: Box<dyn wacore::socket::noise_socket::SendObserver>,
     ) -> Result<(), ClientError> {
         let plaintext = self.marshal_node_for_send(node)?;
+        wacore_binary::util::check_plain_payload(&plaintext).map_err(SocketError::Marshal)?;
         let socket = self.get_noise_socket()?;
         let receiver = socket
             .enqueue_send_observed(plaintext.into(), Some(observer))

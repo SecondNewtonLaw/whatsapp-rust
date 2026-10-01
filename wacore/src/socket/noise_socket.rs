@@ -536,9 +536,8 @@ impl NoiseSocket {
     pub fn enqueue_send(
         &self,
         plaintext: bytes::Bytes,
-    ) -> impl std::future::Future<
-        Output = std::result::Result<oneshot::Receiver<SendResult>, EncryptSendError>,
-    > + '_ {
+    ) -> impl Future<Output = std::result::Result<oneshot::Receiver<SendResult>, EncryptSendError>> + '_
+    {
         self.enqueue_send_observed(plaintext, None)
     }
 

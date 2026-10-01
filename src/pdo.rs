@@ -44,6 +44,11 @@ pub(crate) struct PdoRequestMemo {
     generation: u64,
 }
 
+// Share the gate's lock/hash future across updates instead of each closure type.
+type PdoGateUpdate<'a, R> = &'a mut (
+            dyn FnMut(Option<&Arc<PdoRequestMemo>>) -> (Option<Arc<PdoRequestMemo>>, R) + Send + 'a
+        );
+
 struct PdoAttemptGuard(Arc<PdoRequestMemo>);
 
 impl Drop for PdoAttemptGuard {
@@ -338,7 +343,7 @@ impl Client {
         let request_id = self.generate_message_id();
         let admission = self
             .pdo_requested
-            .upsert_with_by_ref(&gate_key, |current| {
+            .upsert_with_by_ref(&gate_key, &mut |current: Option<&Arc<PdoRequestMemo>>| {
                 let previous = current.and_then(PdoRequestMemo::live_owner);
                 let normalized = previous
                     .as_ref()
@@ -370,7 +375,8 @@ impl Client {
                     },
                     Some((memo, claimed)),
                 )
-            })
+            }
+                as PdoGateUpdate<'_, Option<(Arc<PdoRequestMemo>, bool)>>)
             .await;
         let Some((memo, claimed)) = admission else {
             debug!(
@@ -400,6 +406,7 @@ impl Client {
         let reserved_clone = reserved.clone();
         let transfer_key = gate_key.clone();
         let transfer_memo = memo.clone();
+        let explicit_published = &self.pdo_explicit_published;
         // Keep cache initialization out of the send frame. Its nested gate
         // update otherwise duplicates the cache state machines in this poll.
         let (holder, owner) = Box::pin(self.pdo_pending_requests.get_with(
@@ -407,7 +414,9 @@ impl Client {
             async {
                 let owner = self
                     .pdo_requested
-                    .upsert_with_by_ref(&transfer_key, |current| {
+                    .upsert_with_by_ref(&transfer_key, &mut |current: Option<
+                        &Arc<PdoRequestMemo>,
+                    >| {
                         let previous = current.and_then(|current| {
                             if current.request_id == transfer_memo.request_id {
                                 current
@@ -424,11 +433,11 @@ impl Client {
                         let owner = transfer_memo.winning_owner(previous);
                         attempt.0 = owner.clone();
                         if owner.explicit_retry {
-                            self.pdo_explicit_published
-                                .store(true, std::sync::atomic::Ordering::Release);
+                            explicit_published.store(true, std::sync::atomic::Ordering::Release);
                         }
                         (Some(owner.clone()), owner)
-                    })
+                    }
+                        as PdoGateUpdate<'_, Arc<PdoRequestMemo>>)
                     .await;
                 reserved_clone.store(true, std::sync::atomic::Ordering::Release);
                 (pending.0, owner)
@@ -446,7 +455,7 @@ impl Client {
                 let same_owner = holder.message_info.source.sender == info.source.sender
                     && holder.message_info.source.is_from_me == info.source.is_from_me;
                 self.pdo_requested
-                    .upsert_with_by_ref(&gate_key, |current| {
+                    .upsert_with_by_ref(&gate_key, &mut |current: Option<&Arc<PdoRequestMemo>>| {
                         memo.outcome
                             .store(PDO_FAILED, std::sync::atomic::Ordering::Release);
                         (
@@ -455,7 +464,8 @@ impl Client {
                                 .and_then(|_| same_owner.then(|| owner.live_owner()).flatten()),
                             (),
                         )
-                    })
+                    }
+                        as PdoGateUpdate<'_, ()>)
                     .await;
                 self.pdo_requested
                     .remove_if(&gate_key, &|current| {
@@ -546,7 +556,7 @@ impl Client {
                 .remove_if(&cache_key, &|(_, current)| current.request_id == request_id)
                 .await;
             self.pdo_requested
-                .upsert_with_by_ref(&gate_key, |current| {
+                .upsert_with_by_ref(&gate_key, &mut |current: Option<&Arc<PdoRequestMemo>>| {
                     memo.outcome
                         .store(PDO_FAILED, std::sync::atomic::Ordering::Release);
                     (
@@ -557,7 +567,8 @@ impl Client {
                             }),
                         (),
                     )
-                })
+                }
+                    as PdoGateUpdate<'_, ()>)
                 .await;
             self.pdo_requested
                 .remove_if(&gate_key, &|current| {
@@ -576,14 +587,15 @@ impl Client {
             .store(PDO_SENT, std::sync::atomic::Ordering::Release);
         debug!("PDO request sent successfully for message {}", info.id);
         self.pdo_requested
-            .upsert_with_by_ref(&gate_key, |current| {
+            .upsert_with_by_ref(&gate_key, &mut |current: Option<&Arc<PdoRequestMemo>>| {
                 (
                     current
                         .filter(|current| current.request_id == request_id)
                         .map(|_| memo.sent_owner()),
                     (),
                 )
-            })
+            }
+                as PdoGateUpdate<'_, ()>)
             .await;
         Ok(Some(request_id))
     }

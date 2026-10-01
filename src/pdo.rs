@@ -28,6 +28,128 @@ pub struct PendingPdoRequest {
     pub requested_at: wacore::time::Instant,
 }
 
+const PDO_IN_FLIGHT: u8 = 0;
+const PDO_SENT: u8 = 1;
+const PDO_FAILED: u8 = 2;
+static NEXT_PDO_GENERATION: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(1);
+
+#[derive(Debug)]
+pub(crate) struct PdoRequestMemo {
+    pub(crate) request_id: String,
+    info: Arc<MessageInfo>,
+    explicit_retry: bool,
+    outcome: std::sync::atomic::AtomicU8,
+    previous: Option<Arc<Self>>,
+    generation: u64,
+}
+
+impl PdoRequestMemo {
+    pub(crate) fn new(
+        info: &Arc<MessageInfo>,
+        request_id: String,
+        explicit_retry: bool,
+        previous: Option<Arc<Self>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            request_id,
+            info: info.clone(),
+            explicit_retry,
+            outcome: std::sync::atomic::AtomicU8::new(PDO_IN_FLIGHT),
+            previous,
+            generation: 0,
+        })
+    }
+
+    fn live_owner(self: &Arc<Self>) -> Option<Arc<Self>> {
+        let mut current = self.clone();
+        loop {
+            match current.outcome.load(std::sync::atomic::Ordering::Acquire) {
+                PDO_FAILED => current = current.previous.clone()?,
+                PDO_SENT if current.previous.is_some() => return Some(current.sent_owner()),
+                _ => return Some(current),
+            }
+        }
+    }
+
+    fn sent_owner(&self) -> Arc<Self> {
+        Arc::new(Self {
+            request_id: self.request_id.clone(),
+            info: self.info.clone(),
+            explicit_retry: self.explicit_retry,
+            outcome: std::sync::atomic::AtomicU8::new(PDO_SENT),
+            previous: None,
+            generation: self.generation,
+        })
+    }
+
+    fn winning_owner(self: &Arc<Self>, previous: Option<Arc<Self>>) -> Arc<Self> {
+        Arc::new(Self {
+            request_id: self.request_id.clone(),
+            info: self.info.clone(),
+            explicit_retry: self.explicit_retry,
+            outcome: std::sync::atomic::AtomicU8::new(PDO_IN_FLIGHT),
+            previous,
+            generation: NEXT_PDO_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        })
+    }
+
+    fn matches_source(&self, from_me: bool, participant: Option<&str>) -> bool {
+        pdo_source_matches(&self.info, from_me, participant)
+    }
+
+    fn matches_target(
+        &self,
+        key: &ChatMessageId,
+        from_me: bool,
+        participant: Option<&str>,
+    ) -> bool {
+        let source = &self.info.source;
+        let cache_chat = if !source.is_group && source.chat.is_lid() {
+            source.sender_alt.as_ref().unwrap_or(&source.chat)
+        } else {
+            &source.chat
+        };
+        let same_chat = |chat: &Jid| chat.user == key.chat.user && chat.server == key.chat.server;
+        self.info.id == key.id
+            && (same_chat(&source.chat) || same_chat(cache_chat))
+            && self.matches_source(from_me, participant)
+    }
+}
+
+fn pdo_source_matches(info: &MessageInfo, from_me: bool, participant: Option<&str>) -> bool {
+    let source = &info.source;
+    if from_me != source.is_from_me {
+        return false;
+    }
+    let Some(participant) = participant else {
+        return from_me || !source.is_group;
+    };
+    let Ok(participant) = participant.parse::<Jid>() else {
+        return false;
+    };
+    let participant = participant.to_non_ad();
+    source.sender.to_non_ad() == participant
+        || source
+            .sender_alt
+            .as_ref()
+            .is_some_and(|alt| alt.to_non_ad() == participant)
+}
+
+#[cfg(test)]
+pub(crate) fn test_pending(
+    pending: PendingPdoRequest,
+    request_id: &str,
+    explicit_retry: bool,
+) -> (PendingPdoRequest, Arc<PdoRequestMemo>) {
+    let memo = PdoRequestMemo::new(
+        &pending.message_info,
+        request_id.into(),
+        explicit_retry,
+        None,
+    );
+    (pending, memo.winning_owner(None))
+}
+
 /// Peer-message destination keyed by the namespace the phone's Signal
 /// store actually uses — LID after migration, PN before. Mirrors
 /// whatsmeow's `SendPeerMessage` → `cli.getOwnID().ToNonAD()`. WA Web's
@@ -80,7 +202,8 @@ impl Client {
                     info.source.chat.server,
                     Server::Pn | Server::Lid | Server::Group | Server::Broadcast
                 )
-                && info.source.is_group == info.source.chat.is_group(),
+                && info.source.is_group
+                    == matches!(info.source.chat.server, Server::Group | Server::Broadcast),
             "invalid placeholder chat"
         );
         anyhow::ensure!(
@@ -156,26 +279,38 @@ impl Client {
         // are detached per copy, so a get-then-insert would let two
         // concurrent copies both pass the gate, and only the claim winner may
         // release the slot on send failure below.
-        let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let claimed_clone = claimed.clone();
         let request_id = self.generate_message_id();
-        let memo_id = request_id.clone();
-        let prior_memo = self
+        let admission = self
             .pdo_requested
-            .get_with(gate_key.clone(), async move {
-                claimed_clone.store(true, std::sync::atomic::Ordering::Release);
-                memo_id
+            .upsert_with_by_ref(&gate_key, |current| {
+                let previous = current.and_then(PdoRequestMemo::live_owner);
+                let normalized = previous
+                    .as_ref()
+                    .filter(|owner| current.is_none_or(|cached| !Arc::ptr_eq(owner, cached)))
+                    .cloned();
+                if !explicit_retry && previous.is_some() {
+                    return (normalized, None);
+                }
+                let claimed = previous.is_none();
+                let memo = PdoRequestMemo::new(info, request_id.clone(), explicit_retry, previous);
+                (
+                    if claimed {
+                        Some(memo.clone())
+                    } else {
+                        normalized
+                    },
+                    Some((memo, claimed)),
+                )
             })
             .await;
-        let claimed = claimed.load(std::sync::atomic::Ordering::Acquire);
-        if !claimed && !explicit_retry {
+        let Some((memo, claimed)) = admission else {
             debug!(
                 "PDO request already sent for message {} from {}; not re-requesting",
                 info.id,
                 info.source.sender.observe()
             );
             return Ok(None);
-        }
+        };
 
         // Reserved atomically, not read-then-written. Two senders sharing one
         // `(chat, id)` hold distinct gates and arrive here concurrently, and a
@@ -189,16 +324,37 @@ impl Client {
                 message_info: Arc::clone(info),
                 requested_at: wacore::time::Instant::now(),
             },
-            request_id.clone(),
-            explicit_retry,
+            memo.clone(),
         );
         let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reserved_clone = reserved.clone();
-        let (holder, _, _) = self
+        let transfer_key = gate_key.clone();
+        let transfer_memo = memo.clone();
+        let (holder, owner) = self
             .pdo_pending_requests
             .get_with(cache_key.clone(), async move {
+                let owner = self
+                    .pdo_requested
+                    .upsert_with_by_ref(&transfer_key, |current| {
+                        let previous = current.and_then(|current| {
+                            if current.request_id == transfer_memo.request_id {
+                                current
+                                    .previous
+                                    .as_ref()
+                                    .and_then(PdoRequestMemo::live_owner)
+                            } else {
+                                current.live_owner()
+                            }
+                        });
+                        transfer_memo
+                            .outcome
+                            .store(PDO_FAILED, std::sync::atomic::Ordering::Release);
+                        let owner = transfer_memo.winning_owner(previous);
+                        (Some(owner.clone()), owner)
+                    })
+                    .await;
                 reserved_clone.store(true, std::sync::atomic::Ordering::Release);
-                pending
+                (pending.0, owner)
             })
             .await;
         if !reserved.load(std::sync::atomic::Ordering::Acquire) {
@@ -208,9 +364,27 @@ impl Client {
             // redelivery then recreates the gate, finds its own entry here,
             // and removing it would let a later redelivery send a second
             // request for a message that already has one out.
-            if claimed && holder.message_info.source.sender != info.source.sender {
+            if claimed {
+                let same_owner = holder.message_info.source.sender == info.source.sender
+                    && holder.message_info.source.is_from_me == info.source.is_from_me;
                 self.pdo_requested
-                    .remove_if(&gate_key, |id| id == &request_id)
+                    .upsert_with_by_ref(&gate_key, |current| {
+                        memo.outcome
+                            .store(PDO_FAILED, std::sync::atomic::Ordering::Release);
+                        (
+                            current
+                                .filter(|current| current.request_id == request_id)
+                                .and_then(|_| same_owner.then(|| owner.live_owner()).flatten()),
+                            (),
+                        )
+                    })
+                    .await;
+                self.pdo_requested
+                    .remove_if(&gate_key, |current| {
+                        current.request_id == request_id
+                            && current.outcome.load(std::sync::atomic::Ordering::Acquire)
+                                == PDO_FAILED
+                    })
                     .await;
             }
             // Another sender's request for this `(chat, id)` is in flight.
@@ -226,11 +400,7 @@ impl Client {
             return Ok(None);
         }
 
-        if explicit_retry {
-            self.pdo_requested
-                .insert(gate_key.clone(), request_id.clone())
-                .await;
-        }
+        let memo = owner;
 
         let message_key = wa::MessageKey {
             remote_jid: Some(resolved_jid.to_string()),
@@ -283,22 +453,28 @@ impl Client {
         .await;
         if let Err(e) = send {
             self.pdo_pending_requests
-                .remove_if(&cache_key, |(_, id, _)| id == &request_id)
+                .remove_if(&cache_key, |(_, current)| current.request_id == request_id)
                 .await;
-            if explicit_retry && !claimed {
-                self.pdo_requested
-                    .upsert_with_by_ref(&gate_key, |current| {
-                        (
-                            current.filter(|id| *id == &request_id).map(|_| prior_memo),
-                            (),
-                        )
-                    })
-                    .await;
-            } else {
-                self.pdo_requested
-                    .remove_if(&gate_key, |id| id == &request_id)
-                    .await;
-            }
+            self.pdo_requested
+                .upsert_with_by_ref(&gate_key, |current| {
+                    memo.outcome
+                        .store(PDO_FAILED, std::sync::atomic::Ordering::Release);
+                    (
+                        current
+                            .filter(|current| current.request_id == request_id)
+                            .and_then(|_| {
+                                memo.previous.as_ref().and_then(PdoRequestMemo::live_owner)
+                            }),
+                        (),
+                    )
+                })
+                .await;
+            self.pdo_requested
+                .remove_if(&gate_key, |current| {
+                    current.request_id == request_id
+                        && current.outcome.load(std::sync::atomic::Ordering::Acquire) == PDO_FAILED
+                })
+                .await;
             warn!(
                 "Failed to send PDO request for message {}: {:?}",
                 info.id, e
@@ -307,6 +483,18 @@ impl Client {
         }
 
         debug!("PDO request sent successfully for message {}", info.id);
+        self.pdo_requested
+            .upsert_with_by_ref(&gate_key, |current| {
+                memo.outcome
+                    .store(PDO_SENT, std::sync::atomic::Ordering::Release);
+                (
+                    current
+                        .filter(|current| current.request_id == request_id)
+                        .map(|_| memo.sent_owner()),
+                    (),
+                )
+            })
+            .await;
         Ok(Some(request_id))
     }
 
@@ -900,42 +1088,45 @@ impl Client {
         // only spend one alias lookup after that direct key misses. Groups do
         // not have a PN/LID namespace and must never take this path.
         // Missing IDs are accepted only for validated automatic entries.
-        let matches_pending = |(entry, id, explicit_retry): &(PendingPdoRequest, String, bool)| {
-            if (request_id.is_empty() && *explicit_retry)
-                || (!request_id.is_empty() && id != request_id)
-                || response_from_me != entry.message_info.source.is_from_me
-            {
-                return false;
-            }
-            let Some(participant) = response_participant.as_deref() else {
-                return response_from_me || !entry.message_info.source.is_group;
-            };
-            let Ok(participant) = participant.parse::<Jid>() else {
-                return false;
-            };
-            let participant = participant.to_non_ad();
-            let source = &entry.message_info.source;
-            source.sender.to_non_ad() == participant
-                || source
-                    .sender_alt
-                    .as_ref()
-                    .is_some_and(|alt| alt.to_non_ad() == participant)
+        let matches_pending = |(_, memo): &(PendingPdoRequest, Arc<PdoRequestMemo>)| {
+            ((!request_id.is_empty() && memo.request_id == request_id)
+                || (request_id.is_empty() && !memo.explicit_retry))
+                && memo.matches_source(response_from_me, response_participant.as_deref())
         };
         let mut pending = self
             .pdo_pending_requests
             .remove_if(&cache_key, &matches_pending)
             .await;
+        let alias_key = if !cache_key.chat.is_group() {
+            self.swap_pn_lid_namespace(&cache_key.chat)
+                .await
+                .map(|alias| ChatMessageId::new(alias, msg_id.into()))
+        } else {
+            None
+        };
         if pending.is_none()
-            && !cache_key.chat.is_group()
-            && let Some(alias) = self.swap_pn_lid_namespace(&cache_key.chat).await
+            && let Some(alias_key) = &alias_key
         {
-            let alias_key = ChatMessageId::new(alias, msg_id.into());
             pending = self
                 .pdo_pending_requests
-                .remove_if(&alias_key, matches_pending)
+                .remove_if(alias_key, matches_pending)
                 .await;
         }
-        let pending = pending.map(|(entry, _, _)| entry);
+        let authority = pending.as_ref().map(|(_, memo)| memo.clone());
+        let pending = pending.map(|(entry, _)| entry);
+        if self
+            .obsolete_manual_pdo_response(
+                &cache_key,
+                alias_key.as_ref(),
+                response_from_me,
+                response_participant.as_deref(),
+                request_id,
+                authority.as_ref(),
+            )
+            .await
+        {
+            return;
+        }
 
         let elapsed = pending
             .as_ref()
@@ -973,6 +1164,19 @@ impl Client {
             use wacore::proto_helpers::MessageExt;
             message.get_base_message().get_ephemeral_expiration()
         };
+        if self
+            .obsolete_manual_pdo_response(
+                &cache_key,
+                alias_key.as_ref(),
+                response_from_me,
+                response_participant.as_deref(),
+                request_id,
+                authority.as_ref(),
+            )
+            .await
+        {
+            return;
+        }
         Arc::make_mut(&mut message_info).unavailable_request_id = if request_id.is_empty() {
             None
         } else {
@@ -1015,6 +1219,53 @@ impl Client {
                     .build(),
             ));
         publication.complete();
+    }
+
+    async fn obsolete_manual_pdo_response(
+        &self,
+        key: &ChatMessageId,
+        alias: Option<&ChatMessageId>,
+        from_me: bool,
+        participant: Option<&str>,
+        request_id: &str,
+        authority: Option<&Arc<PdoRequestMemo>>,
+    ) -> bool {
+        let mut manual: Option<Arc<PdoRequestMemo>> = None;
+        // ponytail: bounded memo scan; index targets if PDO traffic grows.
+        let mut consider = |memo: Arc<PdoRequestMemo>| {
+            if let Some(owner) = memo.live_owner()
+                && owner.explicit_retry
+                && (owner.matches_target(key, from_me, participant)
+                    || alias.is_some_and(|alias| owner.matches_target(alias, from_me, participant)))
+            {
+                if manual
+                    .as_ref()
+                    .is_none_or(|known| known.generation < owner.generation)
+                {
+                    manual = Some(owner);
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if let Some(owner) = authority {
+            consider(owner.clone());
+        }
+        for candidate in std::iter::once(key).chain(alias) {
+            if let Some((_, memo)) = self.pdo_pending_requests.get(candidate).await {
+                consider(memo);
+            }
+        }
+        for (gate, snapshot) in self.pdo_requested.snapshot_entries().await {
+            if snapshot.info.id == key.id
+                && snapshot.generation != 0
+                && let Some(memo) = self.pdo_requested.get(gate.as_ref()).await
+            {
+                consider(memo);
+            }
+        }
+        manual.is_some_and(|owner| owner.request_id != request_id)
     }
 
     /// Reconstructs a MessageInfo from a WebMessageInfo.
@@ -1150,7 +1401,7 @@ impl Client {
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
-mod tests {
+pub(crate) mod tests {
     use super::self_peer_target;
     use wacore::store::Device;
     use wacore_binary::{Jid, JidExt, Server};
@@ -1457,7 +1708,10 @@ mod tests {
         );
         client
             .pdo_requested
-            .insert(gate_key, "prior-request".into())
+            .insert(
+                gate_key,
+                super::PdoRequestMemo::new(&info, "prior-request".into(), false, None),
+            )
             .await;
 
         let res = client.send_pdo_placeholder_resend_request(&info).await;
@@ -1508,7 +1762,7 @@ mod tests {
                     first.id.clone(),
                     first.source.sender.clone(),
                 ),
-                "prior-request".into(),
+                super::PdoRequestMemo::new(&first, "prior-request".into(), false, None),
             )
             .await;
 
@@ -1571,12 +1825,12 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(first.source.chat.clone(), first.id.clone()),
-                (
+                super::test_pending(
                     crate::pdo::PendingPdoRequest {
                         message_info: first.clone(),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "req-first".into(),
+                    "req-first",
                     false,
                 ),
             )
@@ -1623,12 +1877,12 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 key.clone(),
-                (
+                super::test_pending(
                     super::PendingPdoRequest {
                         message_info: make_group_message_info(chat, "203040904720543@lid", msg_id),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "req-attr".into(),
+                    "req-attr",
                     false,
                 ),
             )
@@ -1707,12 +1961,12 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 key,
-                (
+                super::test_pending(
                     super::PendingPdoRequest {
                         message_info: std::sync::Arc::new(info),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "req-alias".into(),
+                    "req-alias",
                     false,
                 ),
             )
@@ -1792,12 +2046,12 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(lid.parse().expect("lid"), msg_id.into()),
-                (
+                super::test_pending(
                     super::PendingPdoRequest {
                         message_info: pending,
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "req-pn-alias".into(),
+                    "req-pn-alias",
                     false,
                 ),
             )
@@ -1855,7 +2109,7 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(pn.parse().expect("pn"), msg_id.into()),
-                (
+                super::test_pending(
                     super::PendingPdoRequest {
                         message_info: make_dm_pending_info(
                             pn,
@@ -1865,7 +2119,7 @@ mod tests {
                         ),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "req-lid-alias".into(),
+                    "req-lid-alias",
                     false,
                 ),
             )
@@ -1926,7 +2180,7 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(pn.parse().unwrap(), msg_id.into()),
-                (
+                super::test_pending(
                     super::PendingPdoRequest {
                         message_info: make_dm_pending_info(
                             pn,
@@ -1936,7 +2190,7 @@ mod tests {
                         ),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "req-direct".into(),
+                    "req-direct",
                     false,
                 ),
             )
@@ -1945,7 +2199,7 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(lid.parse().unwrap(), msg_id.into()),
-                (
+                super::test_pending(
                     super::PendingPdoRequest {
                         message_info: make_dm_pending_info(
                             lid,
@@ -1955,7 +2209,7 @@ mod tests {
                         ),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "req-alias-other".into(),
+                    "req-alias-other",
                     false,
                 ),
             )
@@ -2008,7 +2262,7 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 ChatMessageId::new(pn.parse().unwrap(), msg_id.into()),
-                (
+                super::test_pending(
                     super::PendingPdoRequest {
                         message_info: make_dm_pending_info(
                             pn,
@@ -2018,7 +2272,7 @@ mod tests {
                         ),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "req-no-mapping".into(),
+                    "req-no-mapping",
                     false,
                 ),
             )
@@ -2080,12 +2334,12 @@ mod tests {
             .pdo_pending_requests
             .insert(
                 key,
-                (
+                super::test_pending(
                     super::PendingPdoRequest {
                         message_info: std::sync::Arc::new(outgoing),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "req-direction".into(),
+                    "req-direction",
                     false,
                 ),
             )
@@ -2130,17 +2384,19 @@ mod tests {
         );
     }
 
-    mod manual_retry {
-        use super::super::{Arc, Client, MessageInfo, PendingPdoRequest, wa};
+    pub(crate) mod manual_retry {
+        use super::super::{
+            Arc, Client, MessageInfo, PdoRequestMemo, PendingPdoRequest, test_pending, wa,
+        };
         use super::{
             make_group_message_info, make_placeholder_response, make_web_msg, set_own_pn,
             setup_reconstruct_client,
         };
         use wacore::types::jid::JidExt as _;
         use wacore::types::message::ChatMessageId;
-        use wacore_binary::Jid;
+        use wacore_binary::{Jid, JidExt as _};
 
-        async fn manual_retry_client() -> (
+        pub(crate) async fn manual_retry_client() -> (
             Arc<Client>,
             Arc<crate::transport::mock::CapturingMockTransport>,
             Arc<MessageInfo>,
@@ -2182,7 +2438,10 @@ mod tests {
             );
             client
                 .pdo_requested
-                .insert(gate.clone(), "AUTOMATIC_REQUEST".into())
+                .insert(
+                    gate.clone(),
+                    PdoRequestMemo::new(&info, "AUTOMATIC_REQUEST".into(), false, None),
+                )
                 .await;
             let id = client
                 .retry_pdo_placeholder_resend_request(&info)
@@ -2218,9 +2477,235 @@ mod tests {
             }
             assert_eq!(transport.sent().len(), 1);
             assert_eq!(
-                client.pdo_requested.get(&gate).await.as_deref(),
+                client
+                    .pdo_requested
+                    .get(&gate)
+                    .await
+                    .map(|memo| memo.request_id.clone())
+                    .as_deref(),
                 Some(id.as_str())
             );
+            assert!(
+                client
+                    .pdo_requested
+                    .get(&gate)
+                    .await
+                    .unwrap()
+                    .previous
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn reviewed_status_retry_accepts_the_parser_broadcast_source() {
+            let (client, transport, original) = manual_retry_client().await;
+            let stanza = wacore_binary::builder::NodeBuilder::new("message")
+                .attr("from", "status@broadcast")
+                .attr("participant", original.source.sender.clone())
+                .attr("id", original.id.to_string())
+                .attr("type", "text")
+                .build();
+            let stanza = crate::test_utils::node_to_owned_ref(&stanza);
+            let info = Arc::new(client.parse_message_info(stanza.get()).await.unwrap());
+            assert!(info.source.is_group && !info.source.chat.is_group());
+            let id = client
+                .retry_pdo_placeholder_resend_request(&info)
+                .await
+                .unwrap()
+                .unwrap();
+            let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+            assert_eq!(
+                sent.get().attrs().optional_string("id").as_deref(),
+                Some(id.as_str())
+            );
+        }
+
+        #[tokio::test]
+        async fn reviewed_obsolete_manual_replies_never_publish_old_content() {
+            use buffa::Message as _;
+            use wacore::types::events::ChannelEventHandler;
+            let (client, _, info) = manual_retry_client().await;
+            let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+            let mut alias_info = (*info).clone();
+            alias_info.source.sender = "777000000000101@lid".parse().unwrap();
+            alias_info.source.sender_alt = Some(info.source.sender.clone());
+            let first = client
+                .retry_pdo_placeholder_resend_request(&Arc::new(alias_info))
+                .await
+                .unwrap()
+                .unwrap();
+            client.pdo_pending_requests.remove(&key).await;
+            let latest = client
+                .retry_pdo_placeholder_resend_request(&info)
+                .await
+                .unwrap()
+                .unwrap();
+            let (handler, rx) = ChannelEventHandler::new();
+            client.core.event_bus.subscribe_handler(handler).detach();
+            let mut response = make_placeholder_response(
+                &info.source.chat.to_string(),
+                false,
+                &info.id,
+                Some(&info.source.sender.to_string()),
+            );
+            for id in [&first, "", "UNKNOWN_REQUEST"] {
+                client
+                    .handle_placeholder_resend_response(&response, id)
+                    .await;
+                assert_eq!(
+                    client
+                        .pdo_pending_requests
+                        .get(&key)
+                        .await
+                        .unwrap()
+                        .1
+                        .request_id,
+                    latest
+                );
+                while let Ok(event) = rx.try_recv() {
+                    assert!(
+                        event.messages().next().is_none(),
+                        "obsolete manual content was published"
+                    );
+                }
+            }
+            let mut web = waproto::codec::web_message_info_decode(
+                response.web_message_info_bytes.as_ref().unwrap(),
+            )
+            .unwrap();
+            web.message.as_option_mut().unwrap().conversation = Some("LATEST_RESPONSE".into());
+            response.web_message_info_bytes = Some(web.encode_to_vec());
+            client
+                .handle_placeholder_resend_response(&response, &latest)
+                .await;
+            assert!(client.pdo_pending_requests.get(&key).await.is_none());
+            let mut delivered = 0;
+            while let Ok(event) = rx.try_recv() {
+                for message in event.messages() {
+                    assert_eq!(
+                        message.message.conversation.as_deref(),
+                        Some("LATEST_RESPONSE")
+                    );
+                    assert_eq!(message.info.source.chat, info.source.chat);
+                    assert_eq!(message.info.source.sender, info.source.sender);
+                    assert_eq!(message.info.source.is_from_me, info.source.is_from_me);
+                    assert_eq!(
+                        message.info.unavailable_request_id.as_deref(),
+                        Some(latest.as_str())
+                    );
+                    delivered += 1;
+                }
+            }
+            assert_eq!(delivered, 1);
+            web.message.as_option_mut().unwrap().conversation = Some("STALE_AFTER_SUCCESS".into());
+            response.web_message_info_bytes = Some(web.encode_to_vec());
+            client
+                .handle_placeholder_resend_response(&response, &first)
+                .await;
+            while let Ok(event) = rx.try_recv() {
+                assert!(
+                    event.messages().next().is_none(),
+                    "old reply after success was published"
+                );
+            }
+        }
+
+        fn failure_socket(
+            client: &Arc<Client>,
+        ) -> (async_channel::Receiver<()>, async_channel::Sender<()>) {
+            struct GatedFailure {
+                entered: async_channel::Sender<()>,
+                release: async_channel::Receiver<()>,
+            }
+            #[async_trait::async_trait]
+            impl crate::transport::Transport for GatedFailure {
+                async fn send(&self, _: bytes::Bytes) -> anyhow::Result<()> {
+                    self.entered.send(()).await.unwrap();
+                    self.release.recv().await.unwrap();
+                    anyhow::bail!("synthetic send failure")
+                }
+                async fn disconnect(&self) {}
+            }
+            let (entered, receiver) = async_channel::bounded(1);
+            let (release, wait) = async_channel::bounded(1);
+            install_socket(
+                client,
+                Arc::new(GatedFailure {
+                    entered,
+                    release: wait,
+                }),
+            );
+            (receiver, release)
+        }
+
+        fn install_socket(client: &Arc<Client>, transport: Arc<dyn crate::transport::Transport>) {
+            let socket = crate::socket::NoiseSocket::new(
+                Arc::new(crate::runtime_impl::TokioRuntime),
+                transport,
+                wacore::handshake::NoiseCipher::new(&[0u8; 32]).unwrap(),
+                wacore::handshake::NoiseCipher::new(&[0u8; 32]).unwrap(),
+            );
+            *client.noise_socket.lock().unwrap() = Some(Arc::new(socket));
+        }
+
+        #[tokio::test]
+        async fn reviewed_overlapping_failed_sends_leave_no_failed_memo() {
+            use wacore::types::message::SenderMessageId;
+            for attempts in [2, 3] {
+                let (client, transport, info) = manual_retry_client().await;
+                let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+                let gate = SenderMessageId::new(
+                    info.source.chat.clone(),
+                    info.id.clone(),
+                    info.source.sender.clone(),
+                );
+                let mut jobs = Vec::new();
+                for attempt in 0..attempts {
+                    client.pdo_pending_requests.remove(&key).await;
+                    let (entered, release) = failure_socket(&client);
+                    let client_copy = client.clone();
+                    let info_copy = info.clone();
+                    let job = tokio::spawn(async move {
+                        if attempt == 0 {
+                            client_copy
+                                .send_pdo_placeholder_resend_request(&info_copy)
+                                .await
+                        } else {
+                            client_copy
+                                .retry_pdo_placeholder_resend_request(&info_copy)
+                                .await
+                                .map(|_| ())
+                        }
+                    });
+                    tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    jobs.push((job, release));
+                }
+                for (job, release) in jobs {
+                    release.send(()).await.unwrap();
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_secs(5), job)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .is_err()
+                    );
+                }
+                assert!(
+                    client.pdo_requested.get(&gate).await.is_none(),
+                    "failed predecessor was restored"
+                );
+                assert!(transport.sent().is_empty());
+                install_socket(&client, transport.clone());
+                client
+                    .send_pdo_placeholder_resend_request(&info)
+                    .await
+                    .unwrap();
+                crate::test_utils::decode_sent_iq(&transport, 0).await;
+                assert!(client.pdo_pending_requests.get(&key).await.is_some());
+            }
         }
 
         #[tokio::test]
@@ -2318,7 +2803,10 @@ mod tests {
             );
             client
                 .pdo_requested
-                .insert(gate.clone(), "AUTOMATIC_REQUEST".into())
+                .insert(
+                    gate.clone(),
+                    PdoRequestMemo::new(&info, "AUTOMATIC_REQUEST".into(), false, None),
+                )
                 .await;
             *client.noise_socket.lock().unwrap() = None;
             assert!(
@@ -2329,10 +2817,32 @@ mod tests {
             );
             assert_eq!(client.pdo_pending_requests.entry_count_async().await, 0);
             assert_eq!(
-                client.pdo_requested.get(&gate).await.as_deref(),
+                client
+                    .pdo_requested
+                    .get(&gate)
+                    .await
+                    .map(|memo| memo.request_id.clone())
+                    .as_deref(),
                 Some("AUTOMATIC_REQUEST")
             );
             assert!(transport.sent().is_empty());
+            client
+                .pdo_requested
+                .get(&gate)
+                .await
+                .unwrap()
+                .outcome
+                .store(
+                    super::super::PDO_FAILED,
+                    std::sync::atomic::Ordering::Release,
+                );
+            assert!(
+                client
+                    .send_pdo_placeholder_resend_request(&info)
+                    .await
+                    .is_err()
+            );
+            assert!(client.pdo_requested.get(&gate).await.is_none());
         }
 
         #[tokio::test]
@@ -2344,6 +2854,13 @@ mod tests {
                 info.id.clone(),
                 info.source.sender.clone(),
             );
+            client
+                .pdo_requested
+                .insert(
+                    gate.clone(),
+                    PdoRequestMemo::new(&info, "VALID_PRIOR".into(), false, None),
+                )
+                .await;
             let peer: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
             let mutex = client
                 .session_lock_for(peer.to_protocol_address().as_str())
@@ -2367,19 +2884,22 @@ mod tests {
                 .pdo_pending_requests
                 .insert(
                     key.clone(),
-                    (
+                    test_pending(
                         PendingPdoRequest {
-                            message_info: info,
+                            message_info: info.clone(),
                             requested_at: wacore::time::Instant::now(),
                         },
-                        "NEW_REQUEST".into(),
+                        "NEW_REQUEST",
                         true,
                     ),
                 )
                 .await;
             client
                 .pdo_requested
-                .insert(gate.clone(), "NEW_REQUEST".into())
+                .insert(
+                    gate.clone(),
+                    PdoRequestMemo::new(&info, "NEW_REQUEST".into(), true, None),
+                )
                 .await;
             *client.noise_socket.lock().unwrap() = None;
             drop(lock);
@@ -2391,11 +2911,22 @@ mod tests {
                     .is_err()
             );
             assert_eq!(
-                client.pdo_pending_requests.get(&key).await.unwrap().1,
+                client
+                    .pdo_pending_requests
+                    .get(&key)
+                    .await
+                    .unwrap()
+                    .1
+                    .request_id,
                 "NEW_REQUEST"
             );
             assert_eq!(
-                client.pdo_requested.get(&gate).await.as_deref(),
+                client
+                    .pdo_requested
+                    .get(&gate)
+                    .await
+                    .map(|memo| memo.request_id.clone())
+                    .as_deref(),
                 Some("NEW_REQUEST")
             );
             assert!(transport.sent().is_empty());
@@ -2437,7 +2968,13 @@ mod tests {
                 .handle_placeholder_resend_response(&response, &first)
                 .await;
             assert_eq!(
-                client.pdo_pending_requests.get(&key).await.unwrap().1,
+                client
+                    .pdo_pending_requests
+                    .get(&key)
+                    .await
+                    .unwrap()
+                    .1
+                    .request_id,
                 second
             );
             let (handler, rx) = ChannelEventHandler::new();
@@ -2481,12 +3018,12 @@ mod tests {
                     .pdo_pending_requests
                     .insert(
                         key.clone(),
-                        (
+                        test_pending(
                             PendingPdoRequest {
                                 message_info: Arc::new(info.clone()),
                                 requested_at: wacore::time::Instant::now(),
                             },
-                            "CURRENT_REQUEST".into(),
+                            "CURRENT_REQUEST",
                             explicit_retry,
                         ),
                     )
@@ -2510,11 +3047,10 @@ mod tests {
                 while let Ok(event) = rx.try_recv() {
                     delivered.extend(event.messages().map(|message| message.info.clone()));
                 }
-                assert_eq!(delivered.len(), 1);
-                assert_eq!(
-                    delivered[0].push_name.as_str() == "pending metadata",
-                    !explicit_retry
-                );
+                assert_eq!(delivered.len(), usize::from(!explicit_retry));
+                if !explicit_retry {
+                    assert_eq!(delivered[0].push_name.as_str(), "pending metadata");
+                }
             }
         }
     }
@@ -2584,13 +3120,26 @@ mod tests {
 
         client
             .pdo_requested
-            .insert(gate_key.clone(), "req-1".into())
+            .insert(
+                gate_key.clone(),
+                super::PdoRequestMemo::new(
+                    &make_dm_pending_info(
+                        chat,
+                        chat,
+                        msg_id,
+                        wacore::types::message::AddressingMode::Pn,
+                    ),
+                    "req-1".into(),
+                    false,
+                    None,
+                ),
+            )
             .await;
         client
             .pdo_pending_requests
             .insert(
                 key.clone(),
-                (
+                super::test_pending(
                     super::PendingPdoRequest {
                         message_info: make_dm_pending_info(
                             chat,
@@ -2600,7 +3149,7 @@ mod tests {
                         ),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "req-1".into(),
+                    "req-1",
                     false,
                 ),
             )

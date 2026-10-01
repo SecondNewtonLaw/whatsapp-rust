@@ -1969,8 +1969,13 @@ pub struct Client {
     pub(crate) chatstate_handlers: std::sync::RwLock<Arc<[ChatStateHandler]>>,
     pub(crate) chatstate_handler_count: AtomicUsize,
 
-    pub(crate) pdo_pending_requests:
-        Cache<ChatMessageId, (crate::pdo::PendingPdoRequest, String, bool)>,
+    pub(crate) pdo_pending_requests: Cache<
+        ChatMessageId,
+        (
+            crate::pdo::PendingPdoRequest,
+            Arc<crate::pdo::PdoRequestMemo>,
+        ),
+    >,
 
     /// Messages already covered by a placeholder-resend PDO request. Mirrors
     /// the session-lifetime set in
@@ -1983,7 +1988,8 @@ pub struct Client {
     /// is a purely local gate that never has to agree with anything the phone
     /// sends back, so it can name the message precisely; the pending map has
     /// to match a response and keeps the key the phone answers with.
-    pub(crate) pdo_requested: Cache<wacore::types::message::SenderMessageId, String>,
+    pub(crate) pdo_requested:
+        Cache<wacore::types::message::SenderMessageId, Arc<crate::pdo::PdoRequestMemo>>,
 
     /// LRU cache for device registry (matches WhatsApp Web's 5000 entry limit).
     /// Maps user ID to DeviceListRecord for fast device existence checks.

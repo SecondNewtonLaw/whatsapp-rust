@@ -2034,6 +2034,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reviewed_pdo_reclaim_wait_cannot_overwrite_a_newer_memo() {
+        use wacore::types::message::{ChatMessageId, SenderMessageId};
+        let (client, transport, info) =
+            crate::pdo::tests::manual_retry::manual_retry_client().await;
+        let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+        let gate = SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.clone(),
+        );
+        let pending_cache = &client.pdo_pending_requests;
+        let read = pending_cache.inner.read().await;
+        let registry = pending_cache.init_locks();
+        let hash = registry.hash_of(&key);
+        let old = {
+            let client = client.clone();
+            let info = info.clone();
+            tokio::spawn(async move { client.retry_pdo_placeholder_resend_request(&info).await })
+        };
+        let registry_guard = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let guard = registry.map.lock().await;
+                if guard
+                    .get(&hash)
+                    .is_some_and(|mutex| mutex.try_lock().is_none())
+                {
+                    break guard;
+                }
+                drop(guard);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(read);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pending_cache.get(&key).await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!old.is_finished());
+        pending_cache.remove(&key).await;
+        pending_cache
+            .insert(
+                key.clone(),
+                crate::pdo::test_pending(
+                    crate::pdo::PendingPdoRequest {
+                        message_info: info.clone(),
+                        requested_at: Instant::now(),
+                    },
+                    "NEW_REQUEST",
+                    true,
+                ),
+            )
+            .await;
+        client
+            .pdo_requested
+            .insert(
+                gate.clone(),
+                crate::pdo::PdoRequestMemo::new(&info, "NEW_REQUEST".into(), true, None),
+            )
+            .await;
+        drop(registry_guard);
+        tokio::time::timeout(Duration::from_secs(5), old)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        crate::test_utils::decode_sent_iq(&transport, 0).await;
+        assert_eq!(
+            pending_cache.get(&key).await.unwrap().1.request_id,
+            "NEW_REQUEST"
+        );
+        assert_eq!(
+            client
+                .pdo_requested
+                .get(&gate)
+                .await
+                .map(|memo| memo.request_id.clone())
+                .as_deref(),
+            Some("NEW_REQUEST")
+        );
+    }
+
+    #[tokio::test]
     async fn upsert_with_by_ref_serializes_read_modify_write() {
         let cache = Arc::new(build_cache::<String, u32>());
         let mut tasks = Vec::new();

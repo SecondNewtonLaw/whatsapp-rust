@@ -15987,12 +15987,12 @@ mod pdo_alias_tests {
                                 },
                                 ID.into(),
                             ),
-                            (
+                            crate::pdo::test_pending(
                                 crate::pdo::PendingPdoRequest {
                                     message_info: info.clone(),
                                     requested_at: wacore::time::Instant::now(),
                                 },
-                                "SYNTHETIC_PDO_REQUEST".into(),
+                                "SYNTHETIC_PDO_REQUEST",
                                 false,
                             ),
                         )
@@ -16230,12 +16230,12 @@ mod pdo_alias_tests {
             .pdo_pending_requests
             .insert(
                 wacore::types::message::ChatMessageId::new(info.source.chat.clone(), ID.into()),
-                (
+                crate::pdo::test_pending(
                     crate::pdo::PendingPdoRequest {
                         message_info: info.clone(),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "SYNTHETIC_PDO_REQUEST".into(),
+                    "SYNTHETIC_PDO_REQUEST",
                     false,
                 ),
             )
@@ -16380,12 +16380,12 @@ impl PdoRetryFixture {
             .pdo_pending_requests
             .insert(
                 wacore::types::message::ChatMessageId::new(group.clone(), Self::ID.into()),
-                (
+                crate::pdo::test_pending(
                     crate::pdo::PendingPdoRequest {
                         message_info: info,
                         requested_at: wacore::time::Instant::now(),
                     },
-                    "SYNTHETIC_PDO_REQUEST".into(),
+                    "SYNTHETIC_PDO_REQUEST",
                     false,
                 ),
             )
@@ -16672,7 +16672,9 @@ async fn pdo_retry_missing_group_key_recovers_on_phone_and_group_lanes() {
             .get(&pending_key)
             .await
             .unwrap()
-            .1,
+            .1
+            .request_id
+            .clone(),
     );
     fixture.phone_response = PdoRetryFixture::encode_phone_response(
         &mut fixture.phone,

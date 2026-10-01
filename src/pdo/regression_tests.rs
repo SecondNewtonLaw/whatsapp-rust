@@ -462,3 +462,70 @@ async fn missing_transport_releases_retry_but_keeps_the_sent_owner() {
         .await;
     assert_eq!(drain(&rx).len(), 1);
 }
+
+#[tokio::test]
+async fn gate_enumeration_requires_matching_id_generation_and_source() {
+    let (client, info) = client_with_session().await;
+    client
+        .pdo_explicit_published
+        .store(true, std::sync::atomic::Ordering::Release);
+    client
+        .pdo_requested
+        .insert(
+            gate_key(&info),
+            super::super::PdoRequestMemo::sent_for_test(&info, "UNVERSIONED".into(), true),
+        )
+        .await;
+    let mut unrelated = info.clone();
+    Arc::make_mut(&mut unrelated).id = "OTHER_MESSAGE".into();
+    let unrelated_owner =
+        super::super::PdoRequestMemo::new(&unrelated, "UNRELATED".into(), true, None)
+            .winning_owner(None);
+    unrelated_owner
+        .outcome
+        .store(super::super::PDO_SENT, std::sync::atomic::Ordering::Release);
+    client
+        .pdo_requested
+        .insert(gate_key(&unrelated), unrelated_owner)
+        .await;
+    let key = pending_key(&info);
+    let participant = info.source.sender.to_string();
+    assert!(
+        !client
+            .obsolete_pdo_response(&key, None, false, Some(&participant), "OLD", None)
+            .await
+    );
+    let matching =
+        super::super::PdoRequestMemo::new(&info, "LIVE".into(), true, None).winning_owner(None);
+    matching
+        .outcome
+        .store(super::super::PDO_SENT, std::sync::atomic::Ordering::Release);
+    client.pdo_requested.insert(gate_key(&info), matching).await;
+    assert!(
+        client
+            .obsolete_pdo_response(&key, None, false, Some(&participant), "OLD", None)
+            .await
+    );
+    assert!(
+        !client
+            .obsolete_pdo_response(&key, None, false, Some(&participant), "LIVE", None)
+            .await
+    );
+    assert!(
+        !client
+            .obsolete_pdo_response(&key, None, true, Some(&participant), "OLD", None)
+            .await
+    );
+    assert!(
+        !client
+            .obsolete_pdo_response(
+                &key,
+                None,
+                false,
+                Some("12025550109@s.whatsapp.net"),
+                "OLD",
+                None
+            )
+            .await
+    );
+}

@@ -1376,12 +1376,19 @@ impl Client {
             .pdo_explicit_published
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            // ponytail: scan configured gate capacity (default 512); index targets if PDO traffic grows.
-            for (gate, snapshot) in self.pdo_requested.snapshot_entries().await {
-                if snapshot.info.id == key.id
-                    && snapshot.generation != 0
-                    && let Some(memo) = self.pdo_requested.get(gate.as_ref()).await
-                {
+            // Bounded by the configured gate capacity (default 512). Clone
+            // only matching keys; get rechecks expiry and the current owner.
+            let gates = self
+                .pdo_requested
+                .fold_entries(Vec::new(), |mut gates, gate, memo| {
+                    if memo.info.id == key.id && memo.generation != 0 {
+                        gates.push(gate.clone());
+                    }
+                    gates
+                })
+                .await;
+            for gate in gates {
+                if let Some(memo) = self.pdo_requested.get(&gate).await {
                     consider(memo);
                 }
             }

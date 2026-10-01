@@ -544,7 +544,7 @@ impl Client {
                 .await?;
             // Transfer the attempt guard with the actual socket job. Queued
             // work survives its caller, but only the writer starts ownership.
-            self.send_message_impl(
+            Box::pin(self.send_message_impl(
                 peer_target,
                 &msg,
                 crate::send::SendPipelineOptions {
@@ -553,7 +553,7 @@ impl Client {
                     send_observer: Some(Box::new(attempt)),
                     ..Default::default()
                 },
-            )
+            ))
             .await
             .map(|_| ())
         }

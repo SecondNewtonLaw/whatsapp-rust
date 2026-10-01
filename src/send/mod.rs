@@ -2906,11 +2906,7 @@ impl Client {
             stanza_to_send.attrs.insert("type", t.as_wire());
         }
 
-        let send = if let Some(observer) = send_observer {
-            self.send_node_observed(stanza_to_send, observer).await
-        } else {
-            self.send_node(stanza_to_send).await
-        };
+        let send = self.send_node_observed(stanza_to_send, send_observer).await;
         if let Err(e) = send {
             if let Some(msg_id) = ack_message_id {
                 self.response_waiters_guard().remove(msg_id);

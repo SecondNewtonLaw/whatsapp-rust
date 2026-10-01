@@ -87,6 +87,18 @@ impl PdoRequestMemo {
         })
     }
 
+    #[cfg(test)]
+    fn sent_for_test(
+        info: &Arc<MessageInfo>,
+        request_id: String,
+        explicit_retry: bool,
+    ) -> Arc<Self> {
+        let memo = Self::new(info, request_id, explicit_retry, None);
+        memo.outcome
+            .store(PDO_SENT, std::sync::atomic::Ordering::Release);
+        memo
+    }
+
     fn live_owner(self: &Arc<Self>) -> Option<Arc<Self>> {
         let mut current = self.clone();
         loop {
@@ -318,7 +330,7 @@ impl Client {
             })
         {
             self.pdo_pending_requests
-                .remove_if(&cache_key, |(_, memo)| {
+                .remove_if(&cache_key, &|(_, memo)| {
                     memo.outcome.load(std::sync::atomic::Ordering::Acquire) == PDO_FAILED
                 })
                 .await;
@@ -388,9 +400,11 @@ impl Client {
         let reserved_clone = reserved.clone();
         let transfer_key = gate_key.clone();
         let transfer_memo = memo.clone();
-        let (holder, owner) = self
-            .pdo_pending_requests
-            .get_with(cache_key.clone(), async {
+        // Keep cache initialization out of the send frame. Its nested gate
+        // update otherwise duplicates the cache state machines in this poll.
+        let (holder, owner) = Box::pin(self.pdo_pending_requests.get_with(
+            cache_key.clone(),
+            async {
                 let owner = self
                     .pdo_requested
                     .upsert_with_by_ref(&transfer_key, |current| {
@@ -418,8 +432,9 @@ impl Client {
                     .await;
                 reserved_clone.store(true, std::sync::atomic::Ordering::Release);
                 (pending.0, owner)
-            })
-            .await;
+            },
+        ))
+        .await;
         if !reserved.load(std::sync::atomic::Ordering::Acquire) {
             // Only when the slot belongs to a *different* sender. The gate
             // cache has its own 512-entry capacity, so a burst can evict this
@@ -443,7 +458,7 @@ impl Client {
                     })
                     .await;
                 self.pdo_requested
-                    .remove_if(&gate_key, |current| {
+                    .remove_if(&gate_key, &|current| {
                         current.request_id == request_id
                             && current.outcome.load(std::sync::atomic::Ordering::Acquire)
                                 == PDO_FAILED
@@ -528,7 +543,7 @@ impl Client {
         .await;
         if let Err(e) = send {
             self.pdo_pending_requests
-                .remove_if(&cache_key, |(_, current)| current.request_id == request_id)
+                .remove_if(&cache_key, &|(_, current)| current.request_id == request_id)
                 .await;
             self.pdo_requested
                 .upsert_with_by_ref(&gate_key, |current| {
@@ -545,7 +560,7 @@ impl Client {
                 })
                 .await;
             self.pdo_requested
-                .remove_if(&gate_key, |current| {
+                .remove_if(&gate_key, &|current| {
                     current.request_id == request_id
                         && current.outcome.load(std::sync::atomic::Ordering::Acquire) == PDO_FAILED
                 })
@@ -1188,7 +1203,7 @@ impl Client {
         {
             pending = self
                 .pdo_pending_requests
-                .remove_if(alias_key, matches_pending)
+                .remove_if(alias_key, &matches_pending)
                 .await;
         }
         let authority = pending.as_ref().map(|(_, memo)| memo.clone());
@@ -2306,7 +2321,7 @@ mod tests {
                         message_info: direct_info.clone(),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    super::PdoRequestMemo::new(&direct_info, "req-direct".into(), false, None),
+                    super::PdoRequestMemo::sent_for_test(&direct_info, "req-direct".into(), false),
                 ),
             )
             .await;
@@ -2319,7 +2334,11 @@ mod tests {
                         message_info: alias_info.clone(),
                         requested_at: wacore::time::Instant::now(),
                     },
-                    super::PdoRequestMemo::new(&alias_info, "req-alias-other".into(), false, None),
+                    super::PdoRequestMemo::sent_for_test(
+                        &alias_info,
+                        "req-alias-other".into(),
+                        false,
+                    ),
                 ),
             )
             .await;
@@ -2939,7 +2958,7 @@ mod tests {
                 .pdo_requested
                 .insert(
                     gate.clone(),
-                    PdoRequestMemo::new(&info, "AUTOMATIC_REQUEST".into(), false, None),
+                    PdoRequestMemo::sent_for_test(&info, "AUTOMATIC_REQUEST".into(), false),
                 )
                 .await;
             *client.noise_socket.lock().unwrap() = None;

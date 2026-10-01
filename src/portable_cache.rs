@@ -1456,11 +1456,16 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.remove_if(key, |_| true).await
+        self.remove_if(key, &|_| true).await
     }
 
     /// Remove a live entry only when its value matches, under the write lock.
-    pub(crate) async fn remove_if<Q>(&self, key: &Q, matches: impl FnOnce(&V) -> bool) -> Option<V>
+    /// Borrowing the predicate lets call sites share one async state machine.
+    pub(crate) async fn remove_if<Q>(
+        &self,
+        key: &Q,
+        matches: &(dyn Fn(&V) -> bool + Sync),
+    ) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -2043,11 +2048,11 @@ mod tests {
             PortableCache::builder().build(),
         ] {
             cache.insert("key".into(), 7).await;
-            assert_eq!(cache.remove_if("key", |value| *value == 6).await, None);
+            assert_eq!(cache.remove_if("key", &|value| *value == 6).await, None);
             assert_eq!(cache.get("key").await, Some(7));
             let (first, second) = tokio::join!(
-                cache.remove_if("key", |value| *value == 7),
-                cache.remove_if("key", |value| *value == 7),
+                cache.remove_if("key", &|value| *value == 7),
+                cache.remove_if("key", &|value| *value == 7),
             );
             assert_eq!(
                 usize::from(first.is_some()) + usize::from(second.is_some()),

@@ -2417,6 +2417,10 @@ mod tests {
         );
     }
 
+    mod regressions {
+        include!("pdo/regression_tests.rs");
+    }
+
     mod manual_retry {
         use super::super::{
             Arc, Client, MessageInfo, PdoRequestMemo, PendingPdoRequest, test_pending, wa,

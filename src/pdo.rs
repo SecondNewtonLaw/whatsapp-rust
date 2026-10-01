@@ -43,6 +43,19 @@ pub(crate) struct PdoRequestMemo {
     generation: u64,
 }
 
+struct PdoAttemptGuard(Arc<PdoRequestMemo>);
+
+impl Drop for PdoAttemptGuard {
+    fn drop(&mut self) {
+        let _ = self.0.outcome.compare_exchange(
+            PDO_IN_FLIGHT,
+            PDO_FAILED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+}
+
 impl PdoRequestMemo {
     pub(crate) fn new(
         info: &Arc<MessageInfo>,
@@ -279,6 +292,20 @@ impl Client {
         // are detached per copy, so a get-then-insert would let two
         // concurrent copies both pass the gate, and only the claim winner may
         // release the slot on send failure below.
+        if self
+            .pdo_pending_requests
+            .get(&cache_key)
+            .await
+            .is_some_and(|(_, memo)| {
+                memo.outcome.load(std::sync::atomic::Ordering::Acquire) == PDO_FAILED
+            })
+        {
+            self.pdo_pending_requests
+                .remove_if(&cache_key, |(_, memo)| {
+                    memo.outcome.load(std::sync::atomic::Ordering::Acquire) == PDO_FAILED
+                })
+                .await;
+        }
         let request_id = self.generate_message_id();
         let admission = self
             .pdo_requested
@@ -311,6 +338,7 @@ impl Client {
             );
             return Ok(None);
         };
+        let mut attempt = PdoAttemptGuard(memo.clone());
 
         // Reserved atomically, not read-then-written. Two senders sharing one
         // `(chat, id)` hold distinct gates and arrive here concurrently, and a
@@ -332,7 +360,7 @@ impl Client {
         let transfer_memo = memo.clone();
         let (holder, owner) = self
             .pdo_pending_requests
-            .get_with(cache_key.clone(), async move {
+            .get_with(cache_key.clone(), async {
                 let owner = self
                     .pdo_requested
                     .upsert_with_by_ref(&transfer_key, |current| {
@@ -350,6 +378,11 @@ impl Client {
                             .outcome
                             .store(PDO_FAILED, std::sync::atomic::Ordering::Release);
                         let owner = transfer_memo.winning_owner(previous);
+                        attempt.0 = owner.clone();
+                        if owner.explicit_retry {
+                            self.pdo_explicit_published
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
                         (Some(owner.clone()), owner)
                     })
                     .await;
@@ -482,11 +515,11 @@ impl Client {
             return Err(e);
         }
 
+        memo.outcome
+            .store(PDO_SENT, std::sync::atomic::Ordering::Release);
         debug!("PDO request sent successfully for message {}", info.id);
         self.pdo_requested
             .upsert_with_by_ref(&gate_key, |current| {
-                memo.outcome
-                    .store(PDO_SENT, std::sync::atomic::Ordering::Release);
                 (
                     current
                         .filter(|current| current.request_id == request_id)
@@ -1231,7 +1264,6 @@ impl Client {
         authority: Option<&Arc<PdoRequestMemo>>,
     ) -> bool {
         let mut manual: Option<Arc<PdoRequestMemo>> = None;
-        // ponytail: bounded memo scan; index targets if PDO traffic grows.
         let mut consider = |memo: Arc<PdoRequestMemo>| {
             if let Some(owner) = memo.live_owner()
                 && owner.explicit_retry
@@ -1257,12 +1289,18 @@ impl Client {
                 consider(memo);
             }
         }
-        for (gate, snapshot) in self.pdo_requested.snapshot_entries().await {
-            if snapshot.info.id == key.id
-                && snapshot.generation != 0
-                && let Some(memo) = self.pdo_requested.get(gate.as_ref()).await
-            {
-                consider(memo);
+        if self
+            .pdo_explicit_published
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // ponytail: scan configured gate capacity (default 512); index targets if PDO traffic grows.
+            for (gate, snapshot) in self.pdo_requested.snapshot_entries().await {
+                if snapshot.info.id == key.id
+                    && snapshot.generation != 0
+                    && let Some(memo) = self.pdo_requested.get(gate.as_ref()).await
+                {
+                    consider(memo);
+                }
             }
         }
         manual.is_some_and(|owner| owner.request_id != request_id)
@@ -1401,7 +1439,7 @@ impl Client {
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
-pub(crate) mod tests {
+mod tests {
     use super::self_peer_target;
     use wacore::store::Device;
     use wacore_binary::{Jid, JidExt, Server};
@@ -2384,7 +2422,7 @@ pub(crate) mod tests {
         );
     }
 
-    pub(crate) mod manual_retry {
+    mod manual_retry {
         use super::super::{
             Arc, Client, MessageInfo, PdoRequestMemo, PendingPdoRequest, test_pending, wa,
         };
@@ -2396,7 +2434,7 @@ pub(crate) mod tests {
         use wacore::types::message::ChatMessageId;
         use wacore_binary::{Jid, JidExt as _};
 
-        pub(crate) async fn manual_retry_client() -> (
+        async fn manual_retry_client() -> (
             Arc<Client>,
             Arc<crate::transport::mock::CapturingMockTransport>,
             Arc<MessageInfo>,
@@ -2431,6 +2469,11 @@ pub(crate) mod tests {
         #[tokio::test]
         async fn manual_pdo_sends_after_automatic_memo_without_releasing_it() {
             let (client, transport, info) = manual_retry_client().await;
+            assert!(
+                !client
+                    .pdo_explicit_published
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
             let gate = wacore::types::message::SenderMessageId::new(
                 info.source.chat.clone(),
                 info.id.clone(),
@@ -2448,6 +2491,11 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            assert!(
+                client
+                    .pdo_explicit_published
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
             let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
             assert_eq!(sent.get().tag.as_ref(), "message");
             assert_eq!(
@@ -2681,6 +2729,12 @@ pub(crate) mod tests {
                         .await
                         .unwrap()
                         .unwrap();
+                    assert_eq!(
+                        client
+                            .pdo_explicit_published
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        attempt != 0
+                    );
                     jobs.push((job, release));
                 }
                 for (job, release) in jobs {
@@ -2698,6 +2752,11 @@ pub(crate) mod tests {
                     "failed predecessor was restored"
                 );
                 assert!(transport.sent().is_empty());
+                assert!(
+                    client
+                        .pdo_explicit_published
+                        .load(std::sync::atomic::Ordering::Acquire)
+                );
                 install_socket(&client, transport.clone());
                 client
                     .send_pdo_placeholder_resend_request(&info)
@@ -2930,6 +2989,224 @@ pub(crate) mod tests {
                 Some("NEW_REQUEST")
             );
             assert!(transport.sent().is_empty());
+        }
+
+        #[tokio::test]
+        async fn cancelled_pdo_ownership_preserves_automatic_recovery_and_allows_retry() {
+            use buffa::Message as _;
+            use std::time::Duration;
+            use wacore::types::{events::ChannelEventHandler, message::SenderMessageId};
+            for after_publication in [false, true] {
+                let (client, transport, info) = manual_retry_client().await;
+                let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+                let gate = SenderMessageId::new(
+                    info.source.chat.clone(),
+                    info.id.clone(),
+                    info.source.sender.clone(),
+                );
+                client
+                    .send_pdo_placeholder_resend_request(&info)
+                    .await
+                    .unwrap();
+                let automatic = client
+                    .pdo_requested
+                    .get(&gate)
+                    .await
+                    .unwrap()
+                    .request_id
+                    .clone();
+                client.pdo_pending_requests.remove(&key).await;
+                let pending_cache = &client.pdo_pending_requests;
+                let mut read = Some(pending_cache.hold_read_for_test().await);
+                let cancelled = {
+                    let client = client.clone();
+                    let info = info.clone();
+                    tokio::spawn(
+                        async move { client.retry_pdo_placeholder_resend_request(&info).await },
+                    )
+                };
+                let cancelled_id = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Some(memo) = client.pdo_requested.get(&gate).await
+                            && memo.request_id != automatic
+                            && memo.generation != 0
+                        {
+                            break memo.request_id.clone();
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("manual retry did not transfer ownership before pending insertion");
+                let registry_guard = if after_publication {
+                    let guard = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        pending_cache.hold_reclaim_after_init_for_test(&key),
+                    )
+                    .await
+                    .expect("manual retry did not hold the pending cache init lock");
+                    drop(read.take());
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while pending_cache.get(&key).await.is_none() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("manual retry did not publish its pending owner before reclaim");
+                    Some(guard)
+                } else {
+                    None
+                };
+                assert!(!cancelled.is_finished());
+                cancelled.abort();
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(5), cancelled)
+                        .await
+                        .expect("cancelled manual retry did not stop")
+                        .unwrap_err()
+                        .is_cancelled()
+                );
+                drop(read);
+                drop(registry_guard);
+                let memo = client.pdo_requested.get(&gate).await.unwrap();
+                assert_eq!(memo.request_id, cancelled_id);
+                assert_eq!(
+                    memo.outcome.load(std::sync::atomic::Ordering::Acquire),
+                    super::super::PDO_FAILED
+                );
+                assert_eq!(memo.live_owner().unwrap().request_id, automatic);
+                assert_eq!(pending_cache.get(&key).await.is_some(), after_publication);
+                assert_eq!(transport.sent().len(), 1);
+                let (handler, rx) = ChannelEventHandler::new();
+                client.core.event_bus.subscribe_handler(handler).detach();
+                let mut response = make_placeholder_response(
+                    &info.source.chat.to_string(),
+                    false,
+                    &info.id,
+                    Some(&info.source.sender.to_string()),
+                );
+                let mut web = waproto::codec::web_message_info_decode(
+                    response.web_message_info_bytes.as_ref().unwrap(),
+                )
+                .unwrap();
+                web.message.as_option_mut().unwrap().conversation =
+                    Some("AUTOMATIC_RECOVERY".into());
+                response.web_message_info_bytes = Some(web.encode_to_vec());
+                client
+                    .handle_placeholder_resend_response(&response, &automatic)
+                    .await;
+                let mut delivered = 0;
+                while let Ok(event) = rx.try_recv() {
+                    for message in event.messages() {
+                        assert_eq!(
+                            message.message.conversation.as_deref(),
+                            Some("AUTOMATIC_RECOVERY")
+                        );
+                        assert_eq!(
+                            message.info.unavailable_request_id.as_deref(),
+                            Some(automatic.as_str())
+                        );
+                        delivered += 1;
+                    }
+                }
+                assert_eq!(delivered, 1);
+                let retry = client
+                    .retry_pdo_placeholder_resend_request(&info)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(retry, cancelled_id);
+                assert_eq!(pending_cache.get(&key).await.unwrap().1.request_id, retry);
+                crate::test_utils::decode_sent_iq(&transport, 1).await;
+                assert_eq!(transport.sent().len(), 2);
+            }
+        }
+
+        #[tokio::test]
+        async fn reviewed_pdo_reclaim_wait_cannot_overwrite_a_newer_memo() {
+            use std::time::Duration;
+            use wacore::types::message::SenderMessageId;
+            let (client, transport, info) = manual_retry_client().await;
+            let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+            let gate = SenderMessageId::new(
+                info.source.chat.clone(),
+                info.id.clone(),
+                info.source.sender.clone(),
+            );
+            let pending_cache = &client.pdo_pending_requests;
+            let read = pending_cache.hold_read_for_test().await;
+            let old = {
+                let client = client.clone();
+                let info = info.clone();
+                tokio::spawn(
+                    async move { client.retry_pdo_placeholder_resend_request(&info).await },
+                )
+            };
+            let registry_guard = tokio::time::timeout(
+                Duration::from_secs(5),
+                pending_cache.hold_reclaim_after_init_for_test(&key),
+            )
+            .await
+            .expect("PDO retry did not acquire the pending cache init lock");
+            drop(read);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pending_cache.get(&key).await.is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("PDO retry did not publish its pending owner before reclaim");
+            assert!(
+                !old.is_finished(),
+                "PDO retry did not wait for init-lock reclaim"
+            );
+            assert!(
+                client
+                    .pdo_explicit_published
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            pending_cache.remove(&key).await;
+            pending_cache
+                .insert(
+                    key.clone(),
+                    test_pending(
+                        PendingPdoRequest {
+                            message_info: info.clone(),
+                            requested_at: wacore::time::Instant::now(),
+                        },
+                        "NEW_REQUEST",
+                        true,
+                    ),
+                )
+                .await;
+            client
+                .pdo_requested
+                .insert(
+                    gate.clone(),
+                    PdoRequestMemo::new(&info, "NEW_REQUEST".into(), true, None),
+                )
+                .await;
+            drop(registry_guard);
+            tokio::time::timeout(Duration::from_secs(5), old)
+                .await
+                .expect("PDO retry did not finish after releasing init-lock reclaim")
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            crate::test_utils::decode_sent_iq(&transport, 0).await;
+            assert_eq!(
+                pending_cache.get(&key).await.unwrap().1.request_id,
+                "NEW_REQUEST"
+            );
+            assert_eq!(
+                client
+                    .pdo_requested
+                    .get(&gate)
+                    .await
+                    .map(|memo| memo.request_id.clone())
+                    .as_deref(),
+                Some("NEW_REQUEST")
+            );
         }
 
         #[tokio::test]

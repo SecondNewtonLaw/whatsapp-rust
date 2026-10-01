@@ -1990,6 +1990,7 @@ pub struct Client {
     /// to match a response and keeps the key the phone answers with.
     pub(crate) pdo_requested:
         Cache<wacore::types::message::SenderMessageId, Arc<crate::pdo::PdoRequestMemo>>,
+    pub(crate) pdo_explicit_published: AtomicBool,
 
     /// LRU cache for device registry (matches WhatsApp Web's 5000 entry limit).
     /// Maps user ID to DeviceListRecord for fast device existence checks.

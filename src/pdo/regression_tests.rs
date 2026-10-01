@@ -3,6 +3,7 @@ use crate::client::Client;
 use buffa::Message as _;
 use std::sync::Arc;
 use wacore::types::events::{ChannelEventHandler, InboundMessage};
+use wacore::types::jid::JidExt as _;
 use wacore::types::message::{ChatMessageId, MessageInfo, SenderMessageId};
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;

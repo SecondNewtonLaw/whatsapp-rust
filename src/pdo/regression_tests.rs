@@ -210,7 +210,11 @@ async fn cancelled_caller_does_not_undo_a_transport_accepted_retry() {
         async fn disconnect(&self) {}
     }
     let (client, info) = client_with_session().await;
-    let old = send_automatic(&client, &info).await;
+    let old = client
+        .retry_pdo_placeholder_resend_request(&info)
+        .await
+        .unwrap()
+        .unwrap();
     client
         .pdo_pending_requests
         .remove(&pending_key(&info))

@@ -533,11 +533,13 @@ impl NoiseSocket {
     }
 
     /// Enqueues a plaintext frame for encryption and send.
-    pub async fn enqueue_send(
+    pub fn enqueue_send(
         &self,
         plaintext: bytes::Bytes,
-    ) -> std::result::Result<oneshot::Receiver<SendResult>, EncryptSendError> {
-        self.enqueue_send_observed(plaintext, None).await
+    ) -> impl std::future::Future<
+        Output = std::result::Result<oneshot::Receiver<SendResult>, EncryptSendError>,
+    > + '_ {
+        self.enqueue_send_observed(plaintext, None)
     }
 
     /// Like [`Self::enqueue_send`], retaining a per-frame observer until the

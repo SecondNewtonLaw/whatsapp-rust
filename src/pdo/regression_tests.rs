@@ -379,3 +379,86 @@ async fn participant_precedence_keeps_key_identity_separate_from_author() {
         assert_eq!(info.source.sender.to_string(), "12025550102@s.whatsapp.net");
     }
 }
+
+#[tokio::test]
+async fn unpolled_retry_does_not_replace_the_sent_owner() {
+    let (client, info) = client_with_session().await;
+    let old = send_automatic(&client, &info).await;
+    let retry = client.retry_pdo_placeholder_resend_request(&info);
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+    let response = make_placeholder_response(
+        &info.source.chat.to_string(),
+        false,
+        &info.id,
+        Some(&info.source.sender.to_string()),
+    );
+    client
+        .handle_placeholder_resend_response(&response, &old)
+        .await;
+    drop(retry);
+    let delivered = drain(&rx);
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(
+        delivered[0].info.unavailable_request_id.as_deref(),
+        Some(old.as_str())
+    );
+    assert_eq!(
+        client
+            .pdo_requested
+            .get(&gate_key(&info))
+            .await
+            .unwrap()
+            .request_id,
+        old
+    );
+}
+
+#[tokio::test]
+async fn missing_transport_releases_retry_but_keeps_the_sent_owner() {
+    let (client, info) = client_with_session().await;
+    let old = send_automatic(&client, &info).await;
+    client
+        .pdo_pending_requests
+        .remove(&pending_key(&info))
+        .await;
+    *client.noise_socket.lock().unwrap() = None;
+    assert!(
+        client
+            .retry_pdo_placeholder_resend_request(&info)
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .pdo_pending_requests
+            .get(&pending_key(&info))
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        client
+            .pdo_requested
+            .get(&gate_key(&info))
+            .await
+            .unwrap()
+            .request_id,
+        old
+    );
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+    let response = make_placeholder_response(
+        &info.source.chat.to_string(),
+        false,
+        &info.id,
+        Some(&info.source.sender.to_string()),
+    );
+    client
+        .handle_placeholder_resend_response(&response, "UNSENT_RETRY")
+        .await;
+    assert!(drain(&rx).is_empty());
+    client
+        .handle_placeholder_resend_response(&response, &old)
+        .await;
+    assert_eq!(drain(&rx).len(), 1);
+}

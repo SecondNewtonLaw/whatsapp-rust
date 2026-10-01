@@ -44,9 +44,10 @@ pub(crate) struct PdoRequestMemo {
     generation: u64,
 }
 
-// Share the gate's lock/hash future across updates instead of each closure type.
-type PdoGateUpdate<'a, R> = &'a mut (
-            dyn FnMut(Option<&Arc<PdoRequestMemo>>) -> (Option<Arc<PdoRequestMemo>>, R) + Send + 'a
+// Share the gate's lock/hash future across all updates. Capture results locally
+// so neither a different closure nor a different result shape duplicates it.
+type PdoGateUpdate<'a> = &'a mut (
+            dyn FnMut(Option<&Arc<PdoRequestMemo>>) -> (Option<Arc<PdoRequestMemo>>, ()) + Send + 'a
         );
 
 struct PdoAttemptGuard(Arc<PdoRequestMemo>);
@@ -341,8 +342,8 @@ impl Client {
                 .await;
         }
         let request_id = self.generate_message_id();
-        let admission = self
-            .pdo_requested
+        let mut admission = None;
+        self.pdo_requested
             .upsert_with_by_ref(
                 &gate_key,
                 (&mut |current: Option<&Arc<PdoRequestMemo>>| {
@@ -366,20 +367,19 @@ impl Client {
                                     != PDO_FAILED
                             }))
                     {
-                        return (normalized, None);
+                        return (normalized, ());
                     }
                     let claimed = previous.is_none();
                     let memo =
                         PdoRequestMemo::new(info, request_id.clone(), explicit_retry, previous);
-                    (
-                        if claimed {
-                            Some(memo.clone())
-                        } else {
-                            normalized
-                        },
-                        Some((memo, claimed)),
-                    )
-                }) as PdoGateUpdate<'_, Option<(Arc<PdoRequestMemo>, bool)>>,
+                    let next = if claimed {
+                        Some(memo.clone())
+                    } else {
+                        normalized
+                    };
+                    admission = Some((memo, claimed));
+                    (next, ())
+                }) as PdoGateUpdate<'_>,
             )
             .await;
         let Some((memo, claimed)) = admission else {
@@ -416,8 +416,7 @@ impl Client {
         let initialize: wacore::runtime::BoxFuture<'_, _> = Box::pin(
             self.pdo_pending_requests
                 .get_with(cache_key.clone(), async {
-                    let owner = self
-                        .pdo_requested
+                    self.pdo_requested
                         .upsert_with_by_ref(
                             &transfer_key,
                             (&mut |current: Option<&Arc<PdoRequestMemo>>| {
@@ -440,13 +439,12 @@ impl Client {
                                     explicit_published
                                         .store(true, std::sync::atomic::Ordering::Release);
                                 }
-                                (Some(owner.clone()), owner)
-                            })
-                                as PdoGateUpdate<'_, Arc<PdoRequestMemo>>,
+                                (Some(owner), ())
+                            }) as PdoGateUpdate<'_>,
                         )
                         .await;
                     reserved_clone.store(true, std::sync::atomic::Ordering::Release);
-                    (pending.0, owner)
+                    (pending.0, attempt.0.clone())
                 }),
         );
         let (holder, owner) = initialize.await;
@@ -472,7 +470,7 @@ impl Client {
                                     .and_then(|_| same_owner.then(|| owner.live_owner()).flatten()),
                                 (),
                             )
-                        }) as PdoGateUpdate<'_, ()>,
+                        }) as PdoGateUpdate<'_>,
                     )
                     .await;
                 self.pdo_requested
@@ -576,7 +574,7 @@ impl Client {
                                 }),
                             (),
                         )
-                    }) as PdoGateUpdate<'_, ()>,
+                    }) as PdoGateUpdate<'_>,
                 )
                 .await;
             self.pdo_requested
@@ -605,7 +603,7 @@ impl Client {
                             .map(|_| memo.sent_owner()),
                         (),
                     )
-                }) as PdoGateUpdate<'_, ()>,
+                }) as PdoGateUpdate<'_>,
             )
             .await;
         Ok(Some(request_id))

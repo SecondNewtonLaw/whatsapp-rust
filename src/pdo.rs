@@ -31,6 +31,7 @@ pub struct PendingPdoRequest {
 const PDO_IN_FLIGHT: u8 = 0;
 const PDO_SENT: u8 = 1;
 const PDO_FAILED: u8 = 2;
+const PDO_WRITING: u8 = 3;
 static NEXT_PDO_GENERATION: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -47,12 +48,25 @@ struct PdoAttemptGuard(Arc<PdoRequestMemo>);
 
 impl Drop for PdoAttemptGuard {
     fn drop(&mut self) {
-        let _ = self.0.outcome.compare_exchange(
-            PDO_IN_FLIGHT,
-            PDO_FAILED,
+        let _ = self.0.outcome.fetch_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
+            |state| (state != PDO_SENT).then_some(PDO_FAILED),
         );
+    }
+}
+
+impl wacore::socket::noise_socket::SendObserver for PdoAttemptGuard {
+    fn sending(&self) {
+        self.0
+            .outcome
+            .store(PDO_WRITING, std::sync::atomic::Ordering::Release);
+    }
+
+    fn sent(&self) {
+        self.0
+            .outcome
+            .store(PDO_SENT, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -77,7 +91,7 @@ impl PdoRequestMemo {
         let mut current = self.clone();
         loop {
             match current.outcome.load(std::sync::atomic::Ordering::Acquire) {
-                PDO_FAILED => current = current.previous.clone()?,
+                PDO_FAILED | PDO_IN_FLIGHT => current = current.previous.clone()?,
                 PDO_SENT if current.previous.is_some() => return Some(current.sent_owner()),
                 _ => return Some(current),
             }
@@ -117,14 +131,13 @@ impl PdoRequestMemo {
         participant: Option<&str>,
     ) -> bool {
         let source = &self.info.source;
-        let cache_chat = if !source.is_group && source.chat.is_lid() {
-            source.sender_alt.as_ref().unwrap_or(&source.chat)
-        } else {
-            &source.chat
-        };
         let same_chat = |chat: &Jid| chat.user == key.chat.user && chat.server == key.chat.server;
         self.info.id == key.id
-            && (same_chat(&source.chat) || same_chat(cache_chat))
+            && (same_chat(&source.chat)
+                || (!source.is_group
+                    && !source.is_from_me
+                    && (same_chat(&source.sender)
+                        || source.sender_alt.as_ref().is_some_and(same_chat))))
             && self.matches_source(from_me, participant)
     }
 }
@@ -160,7 +173,11 @@ pub(crate) fn test_pending(
         explicit_retry,
         None,
     );
-    (pending, memo.winning_owner(None))
+    let owner = memo.winning_owner(None);
+    owner
+        .outcome
+        .store(PDO_SENT, std::sync::atomic::Ordering::Release);
+    (pending, owner)
 }
 
 /// Peer-message destination keyed by the namespace the phone's Signal
@@ -313,9 +330,22 @@ impl Client {
                 let previous = current.and_then(PdoRequestMemo::live_owner);
                 let normalized = previous
                     .as_ref()
-                    .filter(|owner| current.is_none_or(|cached| !Arc::ptr_eq(owner, cached)))
+                    .filter(|owner| {
+                        current.is_none_or(|cached| {
+                            !Arc::ptr_eq(owner, cached)
+                                && matches!(
+                                    cached.outcome.load(std::sync::atomic::Ordering::Acquire),
+                                    PDO_SENT | PDO_FAILED
+                                )
+                        })
+                    })
                     .cloned();
-                if !explicit_retry && previous.is_some() {
+                if !explicit_retry
+                    && (previous.is_some()
+                        || current.is_some_and(|memo| {
+                            memo.outcome.load(std::sync::atomic::Ordering::Acquire) != PDO_FAILED
+                        }))
+                {
                     return (normalized, None);
                 }
                 let claimed = previous.is_none();
@@ -480,8 +510,20 @@ impl Client {
         let send = async {
             self.ensure_e2e_sessions(std::slice::from_ref(&peer_target))
                 .await?;
-            self.send_peer_message_with_id(peer_target, &msg, &request_id)
-                .await
+            // Transfer the attempt guard with the actual socket job. Queued
+            // work survives its caller, but only the writer starts ownership.
+            self.send_message_impl(
+                peer_target,
+                &msg,
+                crate::send::SendPipelineOptions {
+                    request_id: Some(&request_id),
+                    peer: true,
+                    send_observer: Some(Box::new(attempt)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ())
         }
         .await;
         if let Err(e) = send {
@@ -1101,7 +1143,7 @@ impl Client {
         };
         let remote_jid_str = key.remote_jid.as_deref().unwrap_or("");
         let msg_id = key.id.as_deref().unwrap_or("");
-        let response_participant = key.participant.as_deref().map(str::to_owned);
+        let response_participant = self.pdo_key_participant(&web_msg_info);
         let response_from_me = key.from_me.unwrap_or(false);
 
         let cache_key = match remote_jid_str.parse::<Jid>() {
@@ -1124,6 +1166,10 @@ impl Client {
         let matches_pending = |(_, memo): &(PendingPdoRequest, Arc<PdoRequestMemo>)| {
             ((!request_id.is_empty() && memo.request_id == request_id)
                 || (request_id.is_empty() && !memo.explicit_retry))
+                && matches!(
+                    memo.outcome.load(std::sync::atomic::Ordering::Acquire),
+                    PDO_WRITING | PDO_SENT
+                )
                 && memo.matches_source(response_from_me, response_participant.as_deref())
         };
         let mut pending = self
@@ -1266,7 +1312,6 @@ impl Client {
         let mut latest: Option<Arc<PdoRequestMemo>> = None;
         let mut consider = |memo: Arc<PdoRequestMemo>| {
             if let Some(owner) = memo.live_owner()
-                && (owner.explicit_retry || owner.request_id == memo.request_id)
                 && (owner.matches_target(key, from_me, participant)
                     || alias.is_some_and(|alias| owner.matches_target(alias, from_me, participant)))
             {
@@ -1298,16 +1343,41 @@ impl Client {
                 if snapshot.info.id == key.id
                     && snapshot.generation != 0
                     && let Some(memo) = self.pdo_requested.get(gate.as_ref()).await
-                    && let Some(owner) = memo.live_owner()
-                    && owner.explicit_retry
                 {
-                    consider(owner);
+                    consider(memo);
                 }
             }
         }
         latest.is_some_and(|owner| {
             owner.request_id != request_id && (owner.explicit_retry || !request_id.is_empty())
         })
+    }
+
+    fn pdo_key_participant(&self, web: &wa::WebMessageInfo) -> Option<String> {
+        let key = web.key.as_option()?;
+        if let Some(participant) = &key.participant {
+            return Some(participant.clone());
+        }
+        let chat = key.remote_jid.as_deref()?.parse::<Jid>().ok()?;
+        // WAWebParseWebMessageInfoUtils.buildMsgKey fills a missing key
+        // participant only for groups/status. The top-level participant is
+        // the author, and does not overwrite an existing key identity.
+        if chat.is_group() || chat.is_status_broadcast() {
+            if key.from_me == Some(true) {
+                return web
+                    .original_self_author_user_jid_string
+                    .clone()
+                    .or_else(|| {
+                        self.persistence_manager
+                            .get_device_snapshot()
+                            .pn
+                            .as_ref()
+                            .map(ToString::to_string)
+                    });
+            }
+            return web.participant.clone();
+        }
+        None
     }
 
     /// Reconstructs a MessageInfo from a WebMessageInfo.
@@ -1320,11 +1390,21 @@ impl Client {
             anyhow::bail!("WebMessageInfo missing key");
         };
 
+        let participant = self.pdo_key_participant(web_msg);
+        let author = if key.remote_jid.as_deref().is_some_and(|chat| {
+            chat.parse::<Jid>().is_ok_and(|chat| {
+                chat.is_group() || chat.server == wacore_binary::Server::Broadcast
+            })
+        }) {
+            web_msg.participant.as_deref().or(participant.as_deref())
+        } else {
+            participant.as_deref()
+        };
         self.message_info_from_web_message_parts(
             key.remote_jid.as_deref(),
             key.from_me,
             key.id.as_deref(),
-            key.participant.as_deref(),
+            author,
             web_msg.message_timestamp,
             web_msg.push_name.as_deref(),
         )
@@ -1347,12 +1427,8 @@ impl Client {
         let is_group = remote_jid.is_group();
         let is_from_me = from_me.unwrap_or(false);
 
-        // `key.participant` is the real author for any chat where the sender
-        // differs from the remote_jid — groups AND broadcasts (including
-        // status). Falling back to remote_jid for broadcasts would surface
-        // `status@broadcast` as the sender and erase the author. Matches the
-        // response-handler construction in WAWebNonMessageDataRequestHandlerPlaceholderResend
-        // which maps participant to `author` for both broadcast branches.
+        // The PDO response handler maps the top-level author, falling back to
+        // the normalized key participant, for groups and broadcasts alike.
         let sender = if let Some(p) = participant {
             p.parse()?
         } else if is_from_me {

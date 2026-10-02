@@ -204,6 +204,28 @@ impl Serialize for LazyHistorySync {
     }
 }
 
+// One declaration owns the enum and its authoritative public enumeration.
+macro_rules! event_kinds {
+    ($(#[$enum_attr:meta])* pub enum $name:ident {
+        $($(#[$variant_attr:meta])* $variant:ident,)*
+    }) => {
+        $(#[$enum_attr])*
+        pub enum $name {
+            $($(#[$variant_attr])* $variant,)*
+        }
+
+        impl $name {
+            /// All declared kinds in discriminant order, including retired slots.
+            ///
+            /// Hosts can walk this list to test their handling or registration
+            /// coverage when upgrading. New kinds are appended; matches still
+            /// require a wildcard because this enum is non-exhaustive.
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)*];
+        }
+    };
+}
+
+event_kinds! {
 /// Discriminant for each [`Event`] variant, used to express handler interest
 /// without materializing the event. One per `Event` variant; the value doubles
 /// as a bit index in [`EventInterest`], so there can be at most 128 kinds.
@@ -296,9 +318,9 @@ pub enum EventKind {
     RemoveRecentStickerUpdate,
     FavoritesUpdate,
     StatusPrivacyUpdate,
-    // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
-    // each discriminant as a bit in a u128) and keep the guard pointing at the
-    // last variant.
+    ReachoutTimelockUpdate,
+    // Append new kinds here. The list and capacity guard are generated/derived.
+}
 }
 
 impl EventKind {
@@ -309,7 +331,19 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::StatusPrivacyUpdate as u8) < EventKind::CAPACITY);
+const _: () = {
+    let kinds = EventKind::ALL;
+    assert!(!kinds.is_empty());
+    assert!(kinds.len() <= EventKind::CAPACITY as usize);
+    let last = kinds[kinds.len() - 1] as usize;
+    assert!(last < EventKind::CAPACITY as usize);
+    assert!(last == kinds.len() - 1);
+    let mut i = 0;
+    while i < kinds.len() {
+        assert!(kinds[i] as usize == i);
+        i += 1;
+    }
+};
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -406,7 +440,17 @@ pub struct ChannelEventStats {
 }
 
 impl ChannelEventHandler {
+    /// Bounded by default: 256 waiting events, dropping newest on overflow.
+    /// This replaces the historical unlimited default; use [`Self::unbounded`]
+    /// only when the host supplies its own memory/consumer lifetime bound.
+    /// See [`Self::stats`] for enqueue, full and closed outcomes.
     pub fn new() -> (Arc<Self>, async_channel::Receiver<Arc<Event>>) {
+        Self::with_capacity(256)
+    }
+
+    /// Explicitly unlimited mailbox. Slow or absent consumers can retain every
+    /// event indefinitely; dispatch still never waits for the receiver.
+    pub fn unbounded() -> (Arc<Self>, async_channel::Receiver<Arc<Event>>) {
         let (tx, rx) = async_channel::unbounded();
         (Arc::new(Self::from_sender(tx)), rx)
     }
@@ -579,6 +623,8 @@ impl CoreEventBusInner {
 ///
 /// Dropping it removes the handler. A dispatch that already cloned the old
 /// snapshot may still complete once, while later dispatches cannot see it.
+/// Removal does not retract channel-enqueued events or cancel work a handler
+/// already spawned. Adapter-specific cancellation/lifetime policies still apply.
 #[must_use = "dropping the subscription immediately unregisters the event handler"]
 pub struct Subscription {
     bus: std::sync::Weak<CoreEventBusInner>,
@@ -1225,6 +1271,10 @@ pub enum Event {
     /// variant index, so inserting in the middle renumbers everything after it.
     FavoritesUpdate(FavoritesUpdate),
     StatusPrivacyUpdate(StatusPrivacyUpdate),
+
+    /// The server pushed account reachout restriction state. The raw
+    /// [`Event::MexNotification`] is also delivered to interested consumers.
+    ReachoutTimelockUpdate(ReachoutTimelockUpdate),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1264,6 +1314,30 @@ pub struct MexNotification {
     pub stanza_id: Option<String>,
     pub offline: Option<String>,
     pub payload: serde_json::Value,
+}
+
+/// The same concrete state returned by the typed account reachout query.
+/// Optional fields and unknown enforcement strings are preserved without
+/// normalizing the server's deadline or inventing defaults.
+pub use crate::iq::mex_operations::fetch_reachout_timelock::Xwa2FetchAccountReachoutTimelock as ReachoutTimelock;
+
+/// Payload for [`Event::ReachoutTimelockUpdate`].
+///
+/// Emitted for `NotificationUserReachoutTimelockUpdate`, before its raw MEX
+/// twin. This reports state, not an automatic outgoing-message enforcement
+/// policy. In particular, `state.is_active == Some(false)` reports a lifted
+/// restriction; `None` makes no assertion about whether it is active.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct ReachoutTimelockUpdate {
+    /// Decoded using the pull query's state type and deserializer.
+    pub state: ReachoutTimelock,
+    /// Source of the notification, if present.
+    pub from: Option<Jid>,
+    /// Transport stanza ID, if present.
+    pub stanza_id: Option<String>,
+    /// Verbatim backlog marker, if present; not coerced to a boolean.
+    pub offline: Option<String>,
 }
 
 impl Event {
@@ -1326,6 +1400,7 @@ impl Event {
             Event::RemoveRecentStickerUpdate(_) => EventKind::RemoveRecentStickerUpdate,
             Event::FavoritesUpdate(_) => EventKind::FavoritesUpdate,
             Event::StatusPrivacyUpdate(_) => EventKind::StatusPrivacyUpdate,
+            Event::ReachoutTimelockUpdate(_) => EventKind::ReachoutTimelockUpdate,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -2914,6 +2989,21 @@ mod tests {
         assert_eq!(EventKind::RemoveRecentStickerUpdate as u8, 73);
         assert_eq!(EventKind::FavoritesUpdate as u8, 74);
         assert_eq!(EventKind::StatusPrivacyUpdate as u8, 75);
+        assert_eq!(EventKind::ReachoutTimelockUpdate as u8, 76);
+    }
+
+    #[test]
+    fn event_kind_list_is_discriminant_ordered() {
+        assert_eq!(EventKind::ALL.len(), 77);
+        assert!(EventKind::ALL.len() <= EventKind::CAPACITY as usize);
+        for (i, &kind) in EventKind::ALL.iter().enumerate() {
+            assert_eq!(kind as u8 as usize, i);
+            assert!(EventInterest::ALL.wants(kind));
+            assert!(EventInterest::of(&[kind]).wants(kind));
+        }
+        // ALL deliberately includes unknown/future bits, not just known kinds.
+        assert_eq!(EventInterest::ALL.0, u128::MAX);
+        assert_ne!(EventInterest::of(EventKind::ALL), EventInterest::ALL);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted
@@ -3682,5 +3772,36 @@ mod tests {
             1,
             "the removed subscription receives no future event"
         );
+    }
+
+    #[test]
+    fn channel_default_is_bounded_and_unlimited_is_explicit() {
+        let (handler, receiver) = ChannelEventHandler::new();
+        assert_eq!(receiver.capacity(), Some(256));
+        for _ in 0..300 {
+            handler.handle_event(Arc::new(Event::Connected(Connected::builder().build())));
+        }
+        assert_eq!(receiver.len(), 256);
+        assert_eq!(handler.stats().enqueued, 256);
+        assert_eq!(handler.stats().dropped_full, 44);
+        let (unlimited, receiver) = ChannelEventHandler::unbounded();
+        assert_eq!(receiver.capacity(), None);
+        for _ in 0..300 {
+            unlimited.handle_event(Arc::new(Event::Connected(Connected::builder().build())));
+        }
+        assert_eq!(receiver.len(), 300);
+        assert_eq!(unlimited.stats().dropped_full, 0);
+    }
+
+    #[test]
+    fn channel_zero_capacity_is_one_and_never_rendezvous() {
+        let (handler, receiver) = ChannelEventHandler::with_capacity(0);
+        assert_eq!(receiver.capacity(), Some(1));
+        for _ in 0..2 {
+            handler.handle_event(Arc::new(Event::Connected(Connected::builder().build())));
+        }
+        assert_eq!(receiver.len(), 1);
+        assert_eq!(handler.stats().enqueued, 1);
+        assert_eq!(handler.stats().dropped_full, 1);
     }
 }

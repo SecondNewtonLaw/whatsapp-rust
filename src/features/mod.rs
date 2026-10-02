@@ -19,6 +19,9 @@ mod media_reupload;
 pub mod message_edit;
 mod mex;
 pub(crate) mod newsletter;
+#[cfg(test)]
+mod picture_mutation_tests;
+mod pictures;
 mod polls;
 mod presence;
 mod profile;
@@ -67,8 +70,9 @@ pub use comments::Comments;
 
 pub use contacts::{
     ContactError, Contacts, IsOnWhatsAppResult, ProfilePicture, ProfilePictureLookup,
-    ProfilePictureLookupOptions, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UserInfo,
-    UsernameLookup, UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError, VerifiedName,
+    ProfilePictureLookupOptions, ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType,
+    USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UserInfo, UsernameLookup, UsernameLookupError,
+    UsernameLookupUser, UsyncSubprotocolError, VerifiedName,
 };
 
 pub use events::{EventCreationParams, EventResponseType, Events};
@@ -79,13 +83,13 @@ pub use group_history::{GroupHistoryRetryToken, GroupHistoryShareOutcome, GroupH
 pub use groups::{
     CreateGroupResult, GroupAppealStatus, GroupCreateOptions, GroupDescription,
     GroupEphemeralSettings, GroupError, GroupHierarchy, GroupHistoryAddResult, GroupJoinError,
-    GroupMessageReporter, GroupMetadata, GroupMetadataResult, GroupOverview, GroupOverviewResult,
-    GroupParticipant, GroupParticipantDetails, GroupParticipantOptions, GroupPictureEntry,
-    GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject, Groups, GrowthLockInfo,
-    HistorySharePreparation, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
-    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
-    ParticipantType, PictureType, PreparedGroupHistoryShare, PreviousDescription,
-    ReportedGroupMessage, ReportedGroupMessages, SubgroupKind,
+    GroupLookupResult, GroupMessageReporter, GroupMetadata, GroupMetadataResult, GroupOverview,
+    GroupOverviewResult, GroupParticipant, GroupParticipantDetails, GroupParticipantOptions,
+    GroupPictureEntry, GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject, Groups,
+    GrowthLockInfo, HistorySharePreparation, InviteInfoError, JoinGroupResult, MemberAddMode,
+    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
+    ParticipantChangeResponse, ParticipantType, PictureType, PreparedGroupHistoryShare,
+    PreviousDescription, ReportedGroupMessage, ReportedGroupMessages, SubgroupKind,
 };
 
 pub use labels::Labels;
@@ -101,6 +105,7 @@ pub use mex::{
     MexFatalError, MexGraphQLError, MexRequest, MexResponse, NewChatMessageCapping, OwnUsername,
     ReachoutTimelock,
 };
+pub use mex::{MexDoc, MexOperation};
 
 pub use newsletter::{
     Newsletter, NewsletterAdminInfo, NewsletterAdminProfile, NewsletterError, NewsletterFollower,
